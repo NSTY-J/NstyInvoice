@@ -1,0 +1,144 @@
+<?php
+
+declare(strict_types=1);
+
+namespace MyInvoice\Service\Stats;
+
+use MyInvoice\Infrastructure\Database\Connection;
+use PDO;
+
+/**
+ * Přepočítává cache tabulky `project_revenue_cache` a `client_revenue_cache`
+ * po každé změně faktur (create/update/issue/cancel/delete).
+ *
+ * Ne-stornované faktury všech typů kromě `cancellation` se sčítají per (entity, currency).
+ * `last_invoice_date` = MAX(COALESCE(tax_date, issue_date)) z těchto faktur.
+ *
+ * Idempotentní — vždy mažeme všechny existující řádky pro danou entity a re-insertujeme.
+ */
+final class StatsRecomputer
+{
+    public function __construct(private readonly Connection $db) {}
+
+    /**
+     * Přepočte cache pro projekt podle aktuálního stavu invoices.
+     */
+    public function recomputeProject(int $projectId): void
+    {
+        if ($projectId <= 0) return;
+        $pdo = $this->db->pdo();
+
+        $pdo->beginTransaction();
+        try {
+            $pdo->prepare('DELETE FROM project_revenue_cache WHERE project_id = ?')
+                ->execute([$projectId]);
+
+            $stmt = $pdo->prepare(
+                "SELECT i.currency_id,
+                        SUM(i.total_with_vat) AS revenue,
+                        MAX(COALESCE(i.tax_date, i.issue_date)) AS last_date,
+                        COUNT(*) AS cnt
+                   FROM invoices i
+                  WHERE i.project_id = ?
+                    AND i.status IN ('issued', 'sent', 'reminded', 'paid')
+                    AND i.invoice_type != 'cancellation'
+               GROUP BY i.currency_id"
+            );
+            $stmt->execute([$projectId]);
+            $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            $insert = $pdo->prepare(
+                'INSERT INTO project_revenue_cache (project_id, currency_id, revenue, last_invoice_date, invoice_count)
+                 VALUES (?, ?, ?, ?, ?)'
+            );
+            foreach ($rows as $r) {
+                $insert->execute([
+                    $projectId,
+                    (int) $r['currency_id'],
+                    (float) $r['revenue'],
+                    $r['last_date'] ?: null,
+                    (int) $r['cnt'],
+                ]);
+            }
+            $pdo->commit();
+        } catch (\Throwable $e) {
+            if ($pdo->inTransaction()) $pdo->rollBack();
+            throw $e;
+        }
+    }
+
+    /**
+     * Přepočte cache pro klienta — agreguje VŠECHNY jeho faktury (s project_id i bez).
+     */
+    public function recomputeClient(int $clientId): void
+    {
+        if ($clientId <= 0) return;
+        $pdo = $this->db->pdo();
+
+        $pdo->beginTransaction();
+        try {
+            $pdo->prepare('DELETE FROM client_revenue_cache WHERE client_id = ?')
+                ->execute([$clientId]);
+
+            $stmt = $pdo->prepare(
+                "SELECT i.currency_id,
+                        SUM(i.total_with_vat) AS revenue,
+                        MAX(COALESCE(i.tax_date, i.issue_date)) AS last_date,
+                        COUNT(*) AS cnt
+                   FROM invoices i
+                  WHERE i.client_id = ?
+                    AND i.status IN ('issued', 'sent', 'reminded', 'paid')
+                    AND i.invoice_type != 'cancellation'
+               GROUP BY i.currency_id"
+            );
+            $stmt->execute([$clientId]);
+            $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            $insert = $pdo->prepare(
+                'INSERT INTO client_revenue_cache (client_id, currency_id, revenue, last_invoice_date, invoice_count)
+                 VALUES (?, ?, ?, ?, ?)'
+            );
+            foreach ($rows as $r) {
+                $insert->execute([
+                    $clientId,
+                    (int) $r['currency_id'],
+                    (float) $r['revenue'],
+                    $r['last_date'] ?: null,
+                    (int) $r['cnt'],
+                ]);
+            }
+            $pdo->commit();
+        } catch (\Throwable $e) {
+            if ($pdo->inTransaction()) $pdo->rollBack();
+            throw $e;
+        }
+    }
+
+    /**
+     * Convenience: zavolá recompute pro project i client jedné faktury.
+     * Volat po create/update/issue/cancel/markPaid faktury.
+     *
+     * Pro DELETE faktury volat dvě sady — viz `recomputeForChangedInvoice()` níže.
+     */
+    public function recomputeForInvoiceId(int $invoiceId): void
+    {
+        $stmt = $this->db->pdo()->prepare('SELECT client_id, project_id FROM invoices WHERE id = ?');
+        $stmt->execute([$invoiceId]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$row) return;
+        $this->recomputeClient((int) $row['client_id']);
+        if (!empty($row['project_id'])) {
+            $this->recomputeProject((int) $row['project_id']);
+        }
+    }
+
+    /**
+     * Recompute pro klienta + projekt z předaných ID (potřebné po DELETE,
+     * kdy už řádek faktury neexistuje).
+     */
+    public function recomputeForIds(?int $clientId, ?int $projectId): void
+    {
+        if ($clientId !== null && $clientId > 0) $this->recomputeClient($clientId);
+        if ($projectId !== null && $projectId > 0) $this->recomputeProject($projectId);
+    }
+}

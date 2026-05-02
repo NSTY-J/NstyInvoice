@@ -1,0 +1,83 @@
+import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
+import { useAuthStore } from '@/stores/auth'
+
+const routes: RouteRecordRaw[] = [
+  {
+    path: '/',
+    component: () => import('@/components/layout/AppLayout.vue'),
+    meta: { requiresAuth: true },
+    children: [
+      { path: '',                       name: 'home',           component: () => import('@/pages/Dashboard.vue') },
+      { path: 'clients',                name: 'clients',        component: () => import('@/pages/clients/ClientList.vue') },
+      { path: 'clients/new',            name: 'client-new',     component: () => import('@/pages/clients/ClientForm.vue') },
+      { path: 'clients/:id(\\d+)',      name: 'client-detail',  component: () => import('@/pages/clients/ClientDetail.vue') },
+      { path: 'clients/:id(\\d+)/edit', name: 'client-edit',    component: () => import('@/pages/clients/ClientForm.vue') },
+      { path: 'projects',               name: 'projects',       component: () => import('@/pages/projects/ProjectList.vue') },
+      { path: 'projects/new',           name: 'project-new',    component: () => import('@/pages/projects/ProjectForm.vue') },
+      { path: 'projects/:id(\\d+)',     name: 'project-detail', component: () => import('@/pages/projects/ProjectDetail.vue') },
+      { path: 'projects/:id(\\d+)/edit', name: 'project-edit',  component: () => import('@/pages/projects/ProjectForm.vue') },
+      { path: 'invoices',               name: 'invoices',       component: () => import('@/pages/invoices/InvoiceList.vue') },
+      { path: 'invoices/new',           name: 'invoice-new',    component: () => import('@/pages/invoices/InvoiceEditor.vue') },
+      { path: 'invoices/:id(\\d+)',     name: 'invoice-detail', component: () => import('@/pages/invoices/InvoiceDetail.vue') },
+      { path: 'invoices/:id(\\d+)/edit', name: 'invoice-edit',  component: () => import('@/pages/invoices/InvoiceEditor.vue') },
+      { path: 'bank',                   name: 'bank-statements', component: () => import('@/pages/bank/StatementList.vue') },
+      { path: 'bank/:id(\\d+)',         name: 'bank-detail',     component: () => import('@/pages/bank/StatementDetail.vue') },
+      // Admin (M6)
+      { path: 'admin/activity-log',     name: 'activity-log',   component: () => import('@/pages/admin/ActivityLog.vue'), meta: { adminOnly: true } },
+      { path: 'admin/users',            name: 'admin-users',    component: () => import('@/pages/admin/Users.vue'),       meta: { adminOnly: true } },
+      { path: 'admin/settings',         name: 'admin-settings', component: () => import('@/pages/admin/Settings.vue'),    meta: { adminOnly: true } },
+      { path: 'admin/suppliers',        name: 'admin-suppliers', component: () => import('@/pages/admin/Suppliers.vue'), meta: { adminOnly: true } },
+      { path: 'admin/codebooks',        name: 'admin-codebooks', component: () => import('@/pages/admin/Codebooks.vue'),  meta: { adminOnly: true } },
+      { path: 'admin/export',           name: 'admin-export',    component: () => import('@/pages/admin/Export.vue'),     meta: { adminOnly: true } },
+      { path: 'admin/email-templates',  name: 'admin-email-templates', component: () => import('@/pages/admin/EmailTemplates.vue'), meta: { adminOnly: true } },
+      { path: 'profile/totp',           name: 'profile-totp',          component: () => import('@/pages/TotpSetup.vue') },
+    ],
+  },
+  { path: '/login',  name: 'login',  component: () => import('@/pages/Login.vue'),          meta: { public: true } },
+  { path: '/setup',  name: 'setup',  component: () => import('@/pages/Setup.vue'),          meta: { public: true } },
+  { path: '/forgot', name: 'forgot', component: () => import('@/pages/ForgotPassword.vue'), meta: { public: true } },
+  { path: '/reset',  name: 'reset',  component: () => import('@/pages/ResetPassword.vue'),  meta: { public: true } },
+  {
+    path: '/:pathMatch(.*)*',
+    name: 'not-found',
+    component: () => import('@/pages/NotFound.vue'),
+  },
+]
+
+export const router = createRouter({
+  history: createWebHistory(),
+  routes,
+})
+
+router.beforeEach(async (to) => {
+  const auth = useAuthStore()
+
+  if (auth.setupStatus === null) {
+    try {
+      await auth.fetchSetupStatus()
+    } catch {
+      // ignore
+    }
+  }
+
+  if (auth.needsSetup && to.name !== 'setup') {
+    return { name: 'setup' }
+  }
+  if (!auth.needsSetup && to.name === 'setup') {
+    return { name: 'login' }
+  }
+
+  const requiresAuth = to.matched.some((r) => r.meta.requiresAuth)
+  if (requiresAuth && !auth.isAuthenticated) {
+    const ok = await auth.refresh()
+    if (!ok) return { name: 'login' }
+  }
+
+  // Admin-only stránky
+  const adminOnly = to.matched.some((r) => r.meta.adminOnly)
+  if (adminOnly && auth.user?.role !== 'admin') {
+    return { name: 'home' }
+  }
+
+  return true
+})

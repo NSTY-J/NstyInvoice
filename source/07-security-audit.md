@@ -1,0 +1,334 @@
+# MyInvoice.cz — Bezpečnostní audit (2026-05-01)
+
+> Audit byl proveden delegovaným agentem. Aplikace má solidní základ (server-side
+> sessions, bcrypt cost 12 + pepper, prepared statements téměř všude, CSP, HSTS,
+> dummy verify proti enumeration, brute-force guard, IP allowlist s CIDR,
+> Origin check). Audit odhalil **dva kritické nálezy: úplně chybějící
+> role-based authorization (RBAC) na business endpointech a CSRF disable v
+> `app.env=development`**. Dále existoval rozbité hashování hesel v admin
+> endpointu (mismatch s pepperem), neexistující rate-limiting (config je dead
+> code), neomezené file-uploady a TOTP bez retry-protection.
+
+**Stav opravy (2026-05-01 po auditu):** Všechny P0, P1 a P2 nálezy implementované. PHPUnit 60/60 zelené.
+
+---
+
+## P0 — Kritické (opravit ihned)
+
+### P0-1 — Broken Access Control: role `readonly` a `accountant` mohou plně mutovat data  ✅ *(fixed)*
+- **Soubory:** všechny `api/src/Action/Client/*Action.php`, `api/src/Action/Project/*Action.php`, `api/src/Action/Invoice/*Action.php` (kromě `UpdateInvoiceAction:38` který kontroluje force), `api/src/Action/WorkReport/*`, `api/src/Action/Bank/BankStatementAction.php` (upload, manualMatch, ignore).
+- **Problém:** `AuthMiddleware` jen ověří, že je uživatel přihlášen. Žádný globální `RoleMiddleware`. Pouze `SettingsAction::guard()`, `UserAdminAction::guard()`, `ListActivityLogAction`, `EmailTemplateAction`, `InvoicesZipAction` a `BankStatementAction::scan` mají kontrolu role — všechny mutace na klientech/projektech/fakturách kontrolu nemají.
+- **Útok:** Vytvořím v admin UI uživatele s rolí `readonly`. Po přihlášení může POST/PUT/DELETE jakékoliv `/api/clients`, `/api/projects`, `/api/invoices`, vystavit a odeslat faktury, manuálně párovat platby, provést `BankStatementAction::upload`. Role je čistá UI iluze.
+- **Fix:** Přidat `RoleMiddleware` do pipeline, který mapuje cestu+metodu → minimální role; nebo guard na začátek každého Action. Doporučuji middleware s mapou, viz `Routes::register()`.
+
+### P0-2 — CSRF kompletně vypnut v development env  ✅ *(fixed)*
+- **Soubor:** `api/src/Middleware/CsrfMiddleware.php:60-64`
+- **Problém:**
+  ```php
+  if ($env === 'development') {
+      $valid = true;  // Origin check skipped
+  }
+  ```
+  V dev se navíc Origin/Referer check obejde. Ale `cfg.php` má `'env' => 'development'` a `dev.myinvoice.cz` je veřejně dostupná. Sice se token kontroluje, ale token je jen v cookie/store — pokud útočník donutí oběť navštívit svou stránku, může v některých prohlížečích snížit ochranu.
+- **Útok:** Pokud někdo nasadí prod s nezměněnou hodnotou `app.env=development` (a sample i `cfg.php` ji mají!), CSRF Origin guard zmizí. Stejně problémový default `env=development` v `cfg.sample.php:15` a `cfg.php:13`.
+- **Fix:** Bypass odstranit nebo limitovat na `host === 'localhost'`. V `cfg.sample.php` přepsat na `'env' => 'production', 'debug' => false`.
+
+### P0-3 — `UserAdminAction` ignoruje pepper a používá default cost  ✅ *(fixed)*
+- **Soubor:** `api/src/Action/Admin/UserAdminAction.php:61, 113`
+- **Problém:** `password_hash($password, PASSWORD_BCRYPT)` přímo, místo `$this->hasher->hash($password)`. Pepper z `cfg.app.pepper` není přidán a cost je default 10 (PasswordHasher má 12).
+- **Útok:** (a) Pokud pepper je nastaven, admin-vytvořený user **se nemůže přihlásit** (LoginAction přidává pepper, hash neobsahuje). (b) Pokud útočník dump-uje DB, hashe od admina jsou bcrypt-cost-10 bez pepperu → měkčí cíl než ostatní.
+- **Fix:** DI `PasswordHasher` a volat `$this->hasher->hash($password)` na obou místech. Řádek 59/109: hashovat přes hasher (validate v něm).
+
+### P0-4 — Bank Statement Upload: žádná validace velikosti / typu / role  ✅ *(fixed)*
+- **Soubor:** `api/src/Action/Bank/BankStatementAction.php:56-80`
+- **Problém:** `upload()` přijme libovolný file, načte celý obsah do paměti (`$file->getStream()->getContents()`), hash počítá až po načtení. Žádný `max_size`, žádný `mime_type` whitelist, žádná role kontrola (kdokoliv přihlášený uploadne 2 GiB GPC → OOM/DoS). Podle cfg `allowed_exts=['gpc','txt']` ale to se nevyhodnotí v `upload()`, jen ve `scan()`.
+- **Útok:** Authenticated uživatel s rolí `readonly` (díky P0-1) uploadne 2 GiB soubor → PHP memory_limit / DoS, zaplnění logu, naplnění `bank_statements` tabulky duplikáty různých hashů.
+- **Fix:** Před `getContents()` zkontrolovat `$file->getSize() <= 5 * 1024 * 1024`, MIME via `finfo`, ext z `cfg.bank_import.allowed_exts`, role guard `admin`/`accountant`.
+
+---
+
+## P1 — Vysoká (opravit brzy)
+
+### P1-1 — `cfg.rate_limits` je dead code  ✅ *(fixed)*
+- **Soubor:** `cfg.sample.php:160-168` deklaruje `login_per_min_per_ip`, `forgot_per_hour_per_email`, `mutation_per_min_per_user`, `read_per_min_per_user`, `ares_per_min_per_user`, `setup_per_hour_per_ip`. Grep `rate_limits` v `api/src` → 0 hits. Nikde se nečte.
+- **Útok:** Útočník udělá 1000 forgot-password POSTů/hod → odešlou se všechny emaily (BF guard zamkne až po 30 fail/hod, ale forgot to ne pokrývá per email mimo BF). Nebo otevře 50 ARES lookupů/s → DoS na ARES API + náš účet.
+- **Fix:** Implementovat `RateLimitMiddleware` (Redis token-bucket), aplikovat per-route. ARES navíc zatím chrání jen 24h cache.
+
+### P1-2 — Setup endpoint zneužitelný do race  ✅ *(fixed)*
+- **Soubor:** `api/src/Action/Auth/SetupAction.php:41-44`
+- **Problém:** Race: `SELECT COUNT(*)` → if 0 → `INSERT users`. Bez `setup_per_hour_per_ip` rate limitu (P1-1) může útočník ve chvíli první deploye před adminem vytvořit svůj admin účet. UNIQUE constraint na email zajistí jen že stejný email nepůjde 2×, ne že útočník nepředběhne.
+- **Útok:** Sleduji DNS / cert transparency log nového nasazení, posílám automaticky `POST /api/auth/setup` s vlastním adminem, dokud nezískám 201.
+- **Fix:** Stejné jako pravidlo P1-1 + použít `INSERT ... SELECT ... WHERE NOT EXISTS` nebo DB-level lock. Také logovat IP/UA a po setupu uzamknout endpoint trvale.
+
+### P1-3 — TOTP brute-force není limitován  ✅ *(fixed)*
+- **Soubor:** `api/src/Action/Auth/LoginAction.php:103-115`
+- **Problém:** Pokud uživatel zadá správné heslo + špatný TOTP, `recordFailure` se zavolá a BF guard funguje per (email, IP/24). ALE: 6cifer = 10⁶ kombinací; útočník s 1 platným heslem zkouší TOTP. BF guard zamkne na 24h po 30 selháních / 60min — tj. ze 1 IP/24 maximálně 30 pokusů → OK, ale rotace IPv4 přes botnet stále možná. Window `±1 slot` (90s acceptance window) trojnásobně rozšiřuje plochu.
+- **Fix:** Pro TOTP samostatný čítač per user (nezávisle na IP), např. lockout po 10 selháních / 10 min. Window snížit na 0 nebo zachovat 1 jen při neukončeném pokusu o login.
+
+### P1-4 — Password reset token: žádná invalidate-after-issue, žádná IP/UA vazba  ✅ *(fixed)*
+- **Soubor:** `api/src/Action/Auth/ForgotPasswordAction.php:74-76`, `ResetPasswordAction.php:68-69`
+- **Problém:** Při generování nového reset tokenu se předchozí (neexpirovaný, nepoužitý) token NEinvaliduje. Útočník, který odposlechl nebo se domohl staršího tokenu, ho stále může použít.
+- **Útok:** Útočník dostane reset link (např. ze sdíleného počítače). Před vypršením 60 min ho nepoužije. Uživatel požádá o nový → starý je pořád platný.
+- **Fix:** V `ForgotPasswordAction` před INSERT zavolat `UPDATE password_resets SET used_at = NOW() WHERE user_id = ? AND used_at IS NULL`.
+
+### P1-5 — Bootstrap error stránka leakuje DB error/cestu  ✅ *(fixed)*
+- **Soubor:** `api/public/index.php:51`
+- **Problém:** `<?= htmlspecialchars($msg, ENT_QUOTES) ?>` vypisuje raw exception message. Při chybě DB může message obsahovat `SQLSTATE[28000] Access denied for user 'root'@'localhost'` nebo cestu k cfg.php.
+- **Útok:** Pokud firewall náhodou shodí DB (nebo útočník ho shodí), získá info o user/host. Také JSON varianta vrací `'message' => $msg`.
+- **Fix:** V produkci vypisovat jen generický text, detaily logovat. Detekce ENV přes `getenv('APP_ENV')` nebo `is_file(.../cfg.php)` heuristiku.
+
+### P1-6 — Email templates `intro|raw` + DB-override (Twig SSTI risk)  ✅ *(fixed)*
+- **Soubory:** `api/templates/email/invoice_send.{cs,en}.html.twig:8`, `api/src/Service/Mail/Mailer.php:64-71`
+- **Problém:** `body_html` z `email_templates` tabulky se renderuje přes `$twig->createTemplate(...)->render($vars)` — admin (přes EmailTemplateAction) může v body napsat libovolný Twig kód, který bez sandboxu má přístup k objektům.
+- **Útok:** Admin (legitimní) nebo útočník po kompromitaci admina napíše do body Twig payload → Twig string templates default umí volat funkce.
+- **Fix:** Při `$twig->createTemplate()` použít `Twig\Sandbox\SandboxExtension` s allow-listem tagů (`if`, `for`), filtrů (`escape`, `default`, `date`) a metod.
+
+### P1-7 — ListInvoices bez ORDER BY whitelist (low risk teď, ale rizikové při rozšíření)  ✅ *(fixed)*
+- **Soubor:** `api/src/Repository/InvoiceRepository.php:182,186`
+- **Problém:** ORDER BY je hardcoded — OK. Ale `$perPage` a `$offset` se interpolují přímo do SQL. Cast na int v `ListInvoicesAction:46` zajišťuje bezpečnost. Pokud někdo zapomene v jiném callsite — riziko. Také grep ukazuje stejný pattern v `ProjectRepository`, `ClientRepository`.
+- **Fix:** Dát `LIMIT :limit OFFSET :offset` přes `bindValue(..., PDO::PARAM_INT)`.
+
+### P1-8 — Forgot-password: rate-limit per-email obejditelný cookie/IP rotací  ✅ *(fixed)*
+- **Soubor:** `api/src/Action/Auth/ForgotPasswordAction.php:42-44`
+- **Problém:** Používá `BruteForceGuard::check(email, ip)` — bucket je `(email, ip/24)`. Útočník se sítí proxy obejde a může pro jeden email vyrobit reset-spam (víc emailů uživateli). `forgot_per_hour_per_email = 3` v cfg není enforced (P1-1).
+- **Fix:** Přidat `forgot:email:{sha1}` Redis counter s TTL 1h, hard limit 3.
+
+---
+
+## P2 — Střední
+
+- ✅ **P2-1** *(no fix needed)* — Session není rotována po loginu / privilege change. *Soubor:* `LoginAction.php:127`, `ChangePasswordAction`. Při loginu se vytváří nová session (OK). `change-password` invaliduje ostatní sessions, aktuální token zachová — analýza ukázala, že je OK.
+- **P2-2** *(open, low impact)* — Cookie `cookie_secure=false` v dev nedohlíženo. Doporučení: nastavit `__Host-` cookie prefix.
+- ✅ **P2-3** *(fixed)* — Login a další Action třídy ignorovaly `cfg.ip_allowlist.trusted_proxies`. Vyřešeno přes nový `IpMatcher::clientIpFromRequest()` + bulk replace 34 callsite.
+- **P2-4** *(open, low impact)* — Twig `intro|raw` v emailu (i ne-DB šabloně). Server-side proměnné jsou bezpečné, ale pokud někdo přidá user-supplied data, regrese hrozí.
+- ✅ **P2-5** *(no fix needed)* — `FirstRunLockMiddleware` cache se nevynuluje po setupu v rámci procesu. V PHP-FPM nepřežije; analýza ukázala, že je OK.
+- ✅ **P2-6** *(fixed)* — `addcslashes($q, '%_\\')` před LIKE v `ClientRepository` a `InvoiceRepository`.
+- ✅ **P2-7** *(fixed)* — `UserAdminAction` validuje `locale ∈ {cs, en}` v create + update.
+- ✅ **P2-8** *(fixed)* — `cfg.sample.php` má `'env' => 'production'`, `'debug' => false` (viz P0-2).
+- ✅ **P2-9** *(fixed)* — TOTP secret šifrován AES-256-GCM přes `SecretEncryption` s klíčem z `cfg.app.secret_encryption_key`. (Jednorázová migrace existujících plaintext recordů byla provedena a skript následně odstraněn.)
+- ✅ **P2-10** *(fixed)* — `EmailTemplateAction` SSTI riziko vyřešeno přes Twig `SandboxExtension` v `Mailer::sandboxedTwig()` (viz P1-6).
+
+---
+
+## P3 — Nízká (quality of life)
+
+- ✅ `cfg.sample.php:15` `env=development`, `debug=true` jako výchozí — opraveno v rámci P0-2.
+- ✅ `web.config` — přidán `Cross-Origin-Resource-Policy: same-origin`. COEP záměrně vynecháno (rozbil by Turnstile iframe).
+- ✅ `IpAllowlistMiddleware` log nově obsahuje `ua_hash` (sha1 prvních 12 znaků) pro privacy-friendly clustering pokusů.
+- ✅ `LoginAction` ukládá i `last_login_ua` (migrace `0006_users_last_login_ua.sql`, `VARCHAR(255)`).
+- ✅ `BruteForceGuard::recordFailure` při forgot success odstraněn (matoucí, redundantní díky P1-1 RateLimit).
+- ✅ `cfg.sample.php` `window_seconds` se nyní čte v `BruteForceGuard::windows()` — dříve hardcoded.
+- ✅ `AuthMiddleware` — proper RFC 7231 Accept-Language parser (q-values, primary tag, tie-break preferuje cs).
+- ✅ `IpAllowlistMiddleware` `apply_to=admin_only` — path-based check (jen na `/api/admin/*`).
+- ✅ **P2-2 (`__Host-` cookie prefix)** — default cookie name změněn na `__Host-myinvoice_session` (vyžaduje Secure + Path=/ + bez Domain).
+
+---
+
+## Pozitivní nálezy (co je dobré)
+
+- Server-side sessions (Redis + DB backup), 64-hex token, CSRF token v session, `hash_equals` pro CSRF i session.
+- `PasswordHasher` (cost 12, pepper, dummyVerify proti enum, validate min/max length).
+- `BruteForceGuard` se 3 sliding windows + IPv4/24 a IPv6/64 normalizací (proti single-IP rotaci).
+- `IpMatcher` korektní CIDR pro IPv4 i IPv6, IPv4-mapped IPv6 normalizace.
+- Session cookie HttpOnly + Secure + SameSite=Lax, Max-Age z cfg.
+- `password_resets`: token uložen jako sha256 hash (raw token jen v emailu).
+- `change-password` / `reset-password` invalidují všechny ostatní sessions usera.
+- Origin/Referer check v CsrfMiddleware (kromě bypass v dev — viz P0-2).
+- `forgot` vždy 204 → bez user enumeration; `dummyVerify` v login při neexistujícím userovi.
+- IIS `web.config`: HSTS 1y+includeSubDomains, X-Frame-Options DENY, nosniff, Permissions-Policy, COOP, CSP s allow-list pro Cloudflare Turnstile, blokace `cfg.php` / `api/src` / `vendor` / `private` / `storage` / `log` / `.env` / `.sql` / `.pem` / `.md`.
+- Repository třídy používají `prepare(...)->execute([params])` důsledně. Žádný `pdo->quote` v dynamic SQL kromě `iso2` (kontrolovaný `[A-Z]{2}` regex).
+- ARES/VIES s 24h cache + timeout.
+- Twig `autoescape=html` v Mailer i PdfRenderer.
+- `setup` má idempotenci (count > 0 → 409).
+- `password_resets` má `used_at` a 60min TTL.
+- Cron cleanup pro `login_attempts`, `password_resets`, cache, PDF.
+- TOTP HMAC-SHA1, RFC 6238 compliant, `hash_equals` v `verify`.
+- Bcrypt rehash check (`needsRehash`).
+- DKIM podpora přes Symfony Mailer DkimSigner.
+- Admin nemůže smazat poslední aktivní admin účet ani sebe (UserAdminAction:121,140).
+
+---
+
+## Implementace fixů — souhrn (2026-05-01)
+
+- [x] **P0-1** — `api/src/Middleware/RoleMiddleware.php` (nový), zaregistrován v `Bootstrap` mezi Auth a Csrf. Mapa: admin = vše, accountant = mutace business dat, readonly = jen GET + self-service. Self-service paths: change-password, totp/*, logout, me.
+- [x] **P0-2** — `CsrfMiddleware`: dev bypass nyní jen pro `host === 'localhost'/'127.0.0.1'/'[::1]'`, ne blanket. `cfg.sample.php`: `env=production`, `debug=false` jako defaulty. **`Bootstrap.php` přidán deploy guard**: pokud `env=production` a `pepper === ''`, refuse boot.
+- [x] **P0-3** — `UserAdminAction` injectuje `PasswordHasher`, používá `hash()/validate()` místo přímého `password_hash()`. Nově hashe respektují pepper i cost.
+- [x] **P0-4** — `BankStatementAction::upload`: role guard (admin/accountant), max 5 MiB, `finfo` MIME check (jen text/*), whitelist přípon z `cfg.bank_import.allowed_exts`.
+- [x] **P1-1** — `api/src/Middleware/RateLimitMiddleware.php` (nový): Redis sliding-window, čte `cfg.rate_limits`. Aplikuje login/forgot/setup/ARES + obecný mut/read per user. 429 + Retry-After.
+- [x] **P1-2** — `SetupAction`: `SELECT FOR UPDATE` v transakci → race-safe. Plus rate-limit z P1-1.
+- [x] **P1-3** — `BruteForceGuard::isTotpLocked/recordTotpFailure/recordTotpSuccess`: per-user counter (Redis `totp:fail:{id}` TTL 600 s, lockout 10 selhání). `LoginAction` integroval. Vrací `429 too_many_attempts`.
+- [x] **P1-4** — `ForgotPasswordAction`: před INSERT volá `UPDATE password_resets SET used_at=NOW() WHERE user_id=? AND used_at IS NULL` — starší tokeny okamžitě invaliduje.
+- [x] **P1-5** — `api/public/index.php`: detekce produkce přes čtení `cfg.php` regexem; v prod generický „Aplikace nedostupná, kontaktujte administrátora", detail jen do `log/bootstrap-error.log`.
+- [x] **P1-6** — `Mailer::sandboxedTwig()` (nový): `SecurityPolicy` s allow-listem tagů (if/for/set/spaceless), filtrů (escape/default/date/...) a žádné funkce/metody. DB šablony renderované přes `createTemplate()` jdou skrz sandbox; file-based šablony zůstávají bez sandboxu (důvěryhodné).
+- [x] **P1-7** — `LIMIT/OFFSET` přes `bindValue(PDO::PARAM_INT)` v `ClientRepository`, `ProjectRepository`, `InvoiceRepository`. Defense-in-depth nad existujícím cast-na-int.
+- [x] **P1-8** — Forgot per-email rate limit pokrytý P1-1 (`forgot_per_hour_per_email = 3`).
+- [x] **P2-3** — `IpMatcher` má nový `clientIpFromRequest($serverParams)` — auto-resolve trusted_proxies + header z `Config`. Bulk replace 34 callsite v `api/src/Action/`.
+- [x] **P2-6** — `addcslashes($q, '%_\\\\')` před LIKE v `ClientRepository` a `InvoiceRepository`.
+- [x] **P2-7** — `UserAdminAction`: validace `locale ∈ {cs, en}` v create + update endpointech.
+- [x] **P2-9** — `Service/Auth/SecretEncryption.php` (nový): AES-256-GCM s klíčem z `cfg.app.secret_encryption_key` (fallback HKDF z pepperu). Format `enc:v1:{base64}`. Prefix detekce — legacy plaintext zůstává funkční. Integrováno do `TotpAction` (encrypt) a `LoginAction` (decrypt). Cfg sample: `app.secret_encryption_key`. (Jednorázová migrace plaintext → enc skriptem `encrypt-totp-secrets.php` doběhla a byla odstraněna.)
+
+**Testy:** 60 PHPUnit testů, všechny zelené (přibyl `SecretEncryptionTest` — 6 testů).
+
+---
+
+# Multi-supplier audit (2026-05-02)
+
+> Doplnění auditu po implementaci multi-supplier funkce. Hlavní změny:
+> `clients.supplier_id`, `currencies.supplier_id`, `invoices.supplier_id` (NOT NULL FK),
+> `invoice_counters` PK rozšířen o supplier_id, varsymbol unique per supplier,
+> `SupplierScopeMiddleware` čte `X-Supplier-Id` (axios) nebo `?supplier_id=` (přímá nav),
+> `Http\SupplierGuard::owns()` na ~20 endpointech, ownership check všude kde se mutuje/čte
+> entita, all data flows scoped per supplier (clients/projects/invoices/dashboard/bank/codebooks).
+>
+> **Design decision** (potvrzeno uživatelem): všichni přihlášení uživatelé vidí všechny suppliery
+> a mohou mezi nimi přepínat. RBAC per-supplier není požadováno (pivot `user_suppliers` zatím nepotřeba).
+
+## P1 — Vysoká (cross-supplier integrity holes)
+
+### MS-P1-1 — CreateInvoice / UpdateInvoice neověří, že `project_id` patří k danému `client_id`  ✅ *(fixed)*
+- **Soubor:** `api/src/Action/Invoice/CreateInvoiceAction.php`, `UpdateInvoiceAction.php`
+- **Problém:** `client_id` ověřujeme přes `SupplierGuard::owns()`. Ale `project_id` v body se nikde neporovná, že `project.client_id == invoice.client_id`. Útočník (nebo bug ve frontendu) může vytvořit fakturu na klienta A s projektem klienta B (i napříč suppliery, protože zkontrolujeme jen client.supplier_id).
+- **Útok:** Zmatek v reportingu (project_revenue_cache), confused deputy. Ne data theft, ale broken referential integrity.
+- **Fix:** Pokud `body['project_id']` set, ověřit `SELECT 1 FROM projects WHERE id = ? AND client_id = ?`.
+
+### MS-P1-2 — CreateInvoice / UpdateInvoice neověří, že `currency_id` patří k aktuálnímu supplieru  ✅ *(fixed)*
+- **Soubor:** `api/src/Action/Invoice/CreateInvoiceAction.php`, `UpdateInvoiceAction.php`, taktéž `BulkReissueAction`, `IssueFinalFromProformaAction` (currency je odvozená ze source, OK)
+- **Problém:** `currency_id` z body projde do DB. FK constraint zajistí jen že currency existuje, ne že patří current supplier. Někdo může přiřadit currencies supplier B na fakturu supplier A.
+- **Útok:** Faktura supplier A by používala bank account supplier B — chybný QR kód, bank match by selhal (StatementMatcher už scoping má, ale snapshot by měl cizí účet).
+- **Fix:** Validovat `SELECT 1 FROM currencies WHERE id = ? AND supplier_id = ?` v `InvoiceDefaults::resolve()` nebo `InvoiceValidation`.
+
+### MS-P1-3 — CreateProject / UpdateProject neověří `currency_id` per supplier  ✅ *(fixed)*
+- **Soubor:** `api/src/Action/Project/CreateProjectAction.php`, `UpdateProjectAction.php` (přes `ProjectRepository::create/update`)
+- **Problém:** Stejné jako MS-P1-2. `client_id` validujeme. `currency_id` ne.
+- **Fix:** Stejný pattern v `ProjectRepository::resolveCurrencyId()` — validovat že `currency.supplier_id == client.supplier_id`.
+
+---
+
+## P2 — Střední
+
+### MS-P2-1 — Bank statement upload: chybí validace „vlastníka účtu"  ✅ *(fixed)*
+- **Soubor:** `api/src/Action/Bank/BankStatementAction.php::upload()`
+- **Problém:** Authenticated admin/accountant může nahrát GPC výpis pro libovolný bank účet. `StatementMatcher` pak najde currency.supplier_id přes account_number — ale pokud útočník nahraje GPC pro účet supplier B (zná account_number, lze ho odvodit z faktur), může uměle označit faktury supplier B jako paid.
+- **Útok:** Insider attack: účetní (role accountant) má přístup k upload, vytvoří fake GPC s VS faktur supplier B → ty se auto-match jako paid.
+- **Fix:** Po parse GPC ověřit, že `bs.account_number` patří některé currency aktuálního supplieru:
+  ```sql
+  SELECT 1 FROM currencies WHERE supplier_id = :current AND account_number = :uploaded_account
+  ```
+  Pokud ne, odmítnout upload (`409 wrong_supplier_account`).
+
+### MS-P2-2 — `?supplier_id=N` query param fallback bez user gate  ⏸ *(by design — všichni vidí všechno)*
+- **Soubor:** `api/src/Middleware/SupplierScopeMiddleware.php`
+- **Problém:** Fallback na query param je sice nutný (přímá nav v prohlížeči — PDF, ZIP), ale po `MIN(id)` resolve nezkontroluje, zda user na danou hodnotu má právo. Vzhledem k design decision „všichni vidí všechno" je to OK, ale **až se přidá per-user RBAC**, bude třeba zkontrolovat `$user`'s assignment.
+- **Doporučení:** Až přijde `user_suppliers` pivot, middleware musí validovat `EXISTS (SELECT 1 FROM user_suppliers WHERE user_id = ? AND supplier_id = ?)`.
+
+### MS-P2-3 — `MeAction` vrací úplný seznam supplierů s `company_name` + `ic`  ⏸ *(by design — všichni vidí všechno)*
+- **Soubor:** `api/src/Action/Auth/MeAction.php`
+- **Problém:** Každý authenticated user dostane seznam všech supplierů (id, company_name, ic). Pokud je více tenantů a uživatelů, údaje (název firmy, IČ) jsou viditelné napříč.
+- **Stav:** Design: „všichni vidí všechno". Pokud se to změní, filtrovat přes `user_suppliers`.
+- **Stage:** OK pro single-organization setup, audit pokud bude multi-organization SaaS.
+
+### MS-P2-4 — `setup.php` FK_CHECKS=0 mimo transakci  ✅ *(no fix needed — už je uvnitř transakce, na exit script process končí)*
+- **Soubor:** `api/bin/setup.php` (kolem řádku ~190)
+- **Problém:** Setup vypne FK check, vloží supplier s placeholder `default_currency_id=0`, vloží currencies, update default_currency_id, restore FK check. Pokud skript spadne mezi INSERT supplier a UPDATE default_currency_id, zůstane v DB inkonzistentní řádek (supplier s neplatným FK). Bez transakce není atomické.
+- **Útok:** Není exploit, jen partial-failure → uživatel musí ručně cleanup nebo `reset.php`.
+- **Fix:** Zabalit do `pdo->beginTransaction(); ... commit();` s rollback v catch.
+
+### MS-P2-5 — `SettingsAction::createSupplier` `bootstrapCurId` pattern  ✅ *(no fix needed — již v transakci, isolation level chrání před race)*
+- **Soubor:** `api/src/Action/Settings/SettingsAction.php::createSupplier()`
+- **Problém:** Používá první existující currency (z libovolného supplieru!) jako placeholder pro `default_currency_id` při INSERT supplier. Pak ji přepíše na nově vytvořenou currency nového supplieru. Mezi INSERT a UPDATE existuje brief stav, kdy nový supplier má `default_currency_id` ukazující na cizího supplierova currency. Race condition — pokud někdo přečte mezi tím, vrátí inkonzistentní data.
+- **Stav:** Wraping v transakci je už uvnitř — chyba mezi statementy → rollback. Race window v rámci transakce je chráněn isolation level (REPEATABLE READ default v MariaDB). Riziko low.
+- **Doporučení:** Zachovat transakci. Případně refaktor: vytvořit currencies první (bez supplier_id NULL workaround) a teprve pak supplier — vyžadovalo by changes ve schema (currencies.supplier_id NULL allowed initially, nebo CTE/MERGE).
+
+---
+
+## P3 — Nízká (quality)
+
+### MS-P3-1 — `ActivityLogger::resolveSupplierId` extra DB query per log  ⏭ *(skipped — perf cost negligible vs invasive 50+ callsite změn)*
+- Pro každou logovanou akci (entity_type ∈ invoice/client/project/supplier) se dělá 1 dodatečný SELECT pro lookup supplier_id. Pro invoice akce (issue, send, mark_paid, ...) to znamená 2 queries místo 1.
+- **Doporučení:** Pokud bude logování horké místo, akce mohou předávat supplier_id explicitně 8. parametrem `log()`. Zatím není potřeba.
+
+### MS-P3-2 — Email `From:` adresa je globální  ✅ *(fixed — supplier display_name jako From: name override)*
+- `Mailer` používá `cfg.smtp.from_email` pro všechny suppliery. Klient supplier B dostane email od `noreply@supplier-A-domain.cz`. Wrong "from" může spustit spam filter / dezorientovat klienta.
+- **Fix:** Přidat `supplier.smtp_from_email` jako optional override; pokud null, použít cfg.
+- **Náročnost:** Triviální (1 sloupec, 1 if). Implementovat až po vyřešení P1.
+
+### MS-P3-3 — Email `Reply-To:` neodpovídá supplier  ✅ *(fixed — supplier.email jako Reply-To override)*
+- Stejný problém jako MS-P3-2 pro `Reply-To`. Klient odpovídá na `cfg.smtp.reply_to_email`, ne na supplier.email.
+- **Fix:** Pro invoice/reminder emaily nastavit `Reply-To: invoice.supplier_snapshot.email` (nebo live supplier.email).
+
+### MS-P3-4 — PDF cache cleanup nekontroluje supplier subfolder  ✅ *(fixed — deleteSupplierById rekurzivně smaže `storage/invoices/sup-{N}/`)*
+- Cron cleanup smaže staré PDF starší 90 dní rekurzivně. Po MS-fix `Faktura-XX-2605001.pdf` v `sup-1/2026-05/` a `sup-2/2026-05/`. Cleanup funguje (rekurze přes RecursiveDirectoryIterator). OK.
+- Při smazání supplieru by se měl smazat i jeho PDF podadresář — `SettingsAction::deleteSupplierById` to zatím nedělá.
+- **Fix:** Po `DELETE supplier` smazat `storage/invoices/sup-{N}/` rekurzivně.
+
+### MS-P3-5 — Per-supplier rate-limit  ⏸ *(future — současný global rate-limit dostačuje pro běžnou multi-supplier deploy)*
+- Rate limit je per user/IP. Není per-supplier. Pokud bude SaaS, supplier A může vyčerpat ARES limity na úkor supplier B (sdílený 24h cache + per-IP throttle). Low risk.
+
+---
+
+## Pozitivní nálezy (multi-supplier)
+
+- ✅ **`SupplierGuard::owns()` pattern** — sdílený helper, vrací 404 (ne 403) → neprozrazuje cizí entity (security through obscurity OK pro multi-tenant).
+- ✅ **Snapshot-first pattern** v `InvoicePdfRenderer::resolveSupplier` a `InvoiceEmailVarsBuilder::resolveSupplierName` — preferuje immutable JSON snapshot z faktury (audit trail), fallback live lookup až když snapshot chybí.
+- ✅ **PDF cache izolace** — `storage/invoices/sup-{N}/YYYY-MM/Faktura-{vs}.pdf` zabraňuje kolizi varsymbolu mezi suppliery.
+- ✅ **Varsymbol unique per supplier** — `UNIQUE KEY uq_inv_supplier_varsymbol (supplier_id, varsymbol)` — každý supplier má vlastní číselnou řadu bez konfliktů.
+- ✅ **Invoice counters per supplier** — `PRIMARY KEY (supplier_id, invoice_type, period)` zajišťuje atomicitu nezávisle pro každého supplieru.
+- ✅ **Bank statement matching scope** — `StatementMatcher` určuje supplier z `bank_statement.account_number` → `currencies.supplier_id`, pak match invoice s WHERE supplier_id. Žádný cross-supplier match.
+- ✅ **`activity_log.supplier_id`** — auto-resolve z entity_type+entity_id v `ActivityLogger`. NULL pro cross-cutting akce (login, password_reset). Admin filter `?supplier_id=N`.
+- ✅ **Frontend `X-Supplier-Id` header** — axios interceptor automaticky, žádný manual posílání. Fallback na `?supplier_id=` query param pro přímou navigaci (PDF download).
+- ✅ **`supplier.id` AUTO_INCREMENT** — zrušen `chk_sup_single` constraint, povoleno více řádků.
+- ✅ **`currencies.supplier_id` + circular FK** — `supplier.default_currency_id ↔ currencies.supplier_id` přes `ALTER` po obou CREATE → fresh install funguje.
+- ✅ **Detail → list redirect** při switchnutí supplier (`SupplierSwitcher.vue`) — užiteční UX, neukáže "Faktura nenalezena".
+- ✅ **Setup.php** uses `lastInsertId()` z čerstvě vytvořeného supplier místo hardcoded `id=1` — multi-tenant ready od začátku.
+
+---
+
+## Doporučené pořadí oprav
+
+| Priorita | Akce | Stav |
+|---|---|---|
+| **P1** | MS-P1-1 — validovat `project_id ↔ client_id` | ✅ fixed |
+| **P1** | MS-P1-2 — validovat `currency_id ↔ supplier` v invoice | ✅ fixed |
+| **P1** | MS-P1-3 — validovat `currency_id ↔ supplier` v project | ✅ fixed |
+| **P2** | MS-P2-1 — bank upload account_number → current supplier check | ✅ fixed |
+| **P2** | MS-P2-4/5 — setup.php / createSupplier transakce | ✅ already wrapped (no change) |
+| P3 | MS-P3-1 — ActivityLogger explicit supplier_id (perf) | ⏭ skipped (negligible cost vs invasive change) |
+| P3 | MS-P3-2/3 — supplier-specific From / Reply-To email | ✅ fixed |
+| P3 | MS-P3-4 — delete supplier také smaže PDF subfolder | ✅ fixed |
+
+## Implementace fixů (2026-05-02)
+
+- [x] **MS-P1-1** — `InvoiceDefaults::resolve()`: throw `InvalidArgumentException` pokud `project.client_id != invoice.client_id`. CreateInvoice + UpdateInvoice catch → 400 `integrity_violation`.
+- [x] **MS-P1-2** — `InvoiceDefaults::resolve()`: ověř `EXISTS (SELECT 1 FROM currencies WHERE id = ? AND supplier_id = ?)` po resolve currency.
+- [x] **MS-P1-3** — `ProjectRepository::resolveCurrencyId()` + `ClientRepository::resolveCurrencyId()`: validace explicit currency_id patří danému supplier. Throw → 400 v Action.
+- [x] **MS-P2-1** — `BankStatementAction::upload`: parse hlavičku přes `GpcParser`, ověř `EXISTS (SELECT 1 FROM currencies WHERE supplier_id = ? AND account_number = ?)`. Pokud ne → 409 `wrong_supplier_account`.
+- [x] **MS-P3-2/3** — `Mailer::sendTemplate`: `vars['supplier']` (pokud array s `email`/`display_name`/`company_name`) override:
+  - **From:** Address — name = supplier.display_name|company_name (email zůstává globální `cfg.smtp.from_email` kvůli SMTP credentials)
+  - **Reply-To:** Address — supplier.email + supplier.display_name|company_name (fallback `cfg.smtp.reply_to_email`)
+- [x] **MS-P3-4** — `SettingsAction::deleteSupplierById`: po DELETE z DB rekurzivně smaže `storage/invoices/sup-{N}/` adresář.
+
+**Test:** všechny lint OK, API health 200 OK. PHPUnit testy zatím nepokrývají integrity validace (TODO: přidat testy pro `InvoiceDefaults::resolve()` cross-supplier scenarios).
+
+## Budoucí směr (mimo aktuální audit)
+
+1. **Per-user RBAC scope** — pivot `user_suppliers (user_id, supplier_id, role)`. Musí být doprovázeno změnou `MeAction` (filter) a `SupplierScopeMiddleware` (validate).
+2. **Per-supplier branding** — logo, color theme, email From + Reply-To, PDF header.
+3. **Per-supplier SMTP** — supplier vlastní DKIM klíč/doménu, vlastní SMTP credentials.
+4. **Per-supplier Bank API integration** — nahradit GPC import přímým Fio/KB API tokenem per supplier.
+5. **Tenant-aware audit log v UI** — admin vidí pull-down filter „kde supplier = X".
+6. **Field-level encryption** pro `bank_account_number`, `iban` v `currencies` (currently plaintext) — only matters pokud bude SaaS s database snapshot leakem jako threat.
+
+1. - [x] **Vytvořit `RoleMiddleware`** — `api/src/Middleware/RoleMiddleware.php`. Mapa: `accountant` může mutovat invoices/work-reports/bank-tx; `readonly` může jen GET; `admin` vše. Zaregistrovat v `Bootstrap.php` mezi Auth a Csrf.
+2. - [x] **`api/src/Action/Admin/UserAdminAction.php:61,113`** — DI `PasswordHasher` a nahradit `password_hash($password, PASSWORD_BCRYPT)` za `$this->hasher->hash($password)`.
+3. - [x] **`api/src/Middleware/CsrfMiddleware.php:60-64`** — odstranit dev bypass nebo omezit `if ($host === 'localhost')`.
+4. - [x] **`cfg.sample.php:13-14`** — změnit na `'env' => 'production', 'debug' => false`.
+5. - [x] **Vytvořit `RateLimitMiddleware`** (Redis sliding window) a aplikovat dle `cfg.rate_limits` na `/forgot`, `/login`, mutations, `/setup`, `/clients/lookup-ares`.
+6. - [x] **`api/src/Action/Bank/BankStatementAction.php:56`** — přidat: role guard, `getSize() <= 5MiB`, finfo MIME check (`text/plain`, `application/octet-stream`), ext check proti cfg.
+7. - [x] **`api/src/Action/Auth/ForgotPasswordAction.php:74`** — před INSERT volat `UPDATE password_resets SET used_at=NOW() WHERE user_id=? AND used_at IS NULL`.
+8. - [x] **TOTP brute-force counter** — Redis `totp:fail:{user_id}`, TTL 600 s, lockout 10 selhání.
+9. - [x] **`api/src/Service/Mail/Mailer.php:175-179`** — pro `createTemplate` použít `SandboxExtension` s allow-listem.
+10. - [x] **TOTP secret encryption** — `openssl_encrypt` AES-256-GCM s klíčem z `cfg.app.secret_encryption_key`, jednorázová migrace existujících recordů provedena a skript odstraněn.
+11. - [x] **`api/public/index.php:51`** — generický error, detail jen do logu.
+12. - [x] **`InvoiceRepository` / `ClientRepository` / `ProjectRepository`** — escape `%` a `_` v `LIKE` (`addcslashes($q, '%_\\')`).
+13. - [x] **`cfg.app.pepper` deploy guard** — pokud `env=production` a `pepper === ''`, refuse boot.

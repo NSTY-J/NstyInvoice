@@ -1,0 +1,147 @@
+<?php
+
+declare(strict_types=1);
+
+namespace MyInvoice\Action\Project;
+
+use MyInvoice\Http\Json;
+use MyInvoice\Infrastructure\Database\Connection;
+use MyInvoice\Middleware\SupplierScopeMiddleware;
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+
+/**
+ * GET /api/projects/stats — souhrnné statistiky zakázek pro grafy v UI:
+ *  - top 10 zakázek dle obratu pro this_year a prev_year (zbytek do "Ostatní")
+ *  - status breakdown (active / paused / closed)
+ *  - primární měna (nejčastější ve fakturách)
+ *  - YTD total per currency
+ */
+final class ProjectStatsAction
+{
+    public function __construct(private readonly Connection $db) {}
+
+    public function __invoke(Request $request, Response $response): Response
+    {
+        $pdo = $this->db->pdo();
+        $thisYear = (int) date('Y');
+        $prevYear = $thisYear - 1;
+        $sid = (int) $request->getAttribute(SupplierScopeMiddleware::ATTR_CURRENT_ID, 0);
+
+        // Primární měna — nejvyužívanější ve fakturách (proti zaplnění grafů různými měnami)
+        $stmt = $pdo->prepare(
+            "SELECT cur.code AS currency
+               FROM invoices i
+               JOIN currencies cur ON cur.id = i.currency_id
+              WHERE i.supplier_id = ?
+                AND i.status != 'cancelled' AND i.invoice_type != 'cancellation'
+           GROUP BY cur.code
+           ORDER BY COUNT(*) DESC
+              LIMIT 1"
+        );
+        $stmt->execute([$sid]);
+        $primaryCurrency = (string) ($stmt->fetchColumn() ?: 'CZK');
+
+        return Json::ok($response, [
+            'this_year'        => $thisYear,
+            'prev_year'        => $prevYear,
+            'primary_currency' => $primaryCurrency,
+            'top_this_year'    => $this->topProjects($pdo, $thisYear, $primaryCurrency, $sid),
+            'top_prev_year'    => $this->topProjects($pdo, $prevYear, $primaryCurrency, $sid),
+            'totals_per_year'  => $this->totalsPerYear($pdo, [$thisYear, $prevYear], $sid),
+            'status_breakdown' => $this->statusBreakdown($pdo, $sid),
+        ]);
+    }
+
+    /**
+     * Top 10 zakázek dle obratu v daném roce a měně + souhrn "Ostatní".
+     * @return array{top: list<array<string,mixed>>, others: array{revenue: float, count: int}}
+     */
+    private function topProjects(\PDO $pdo, int $year, string $currency, int $sid): array
+    {
+        $stmt = $pdo->prepare(
+            "SELECT p.id, p.name,
+                    c.company_name AS client_company_name,
+                    SUM(i.total_with_vat) AS revenue,
+                    COUNT(i.id) AS invoice_count
+               FROM invoices i
+               JOIN projects p ON p.id = i.project_id
+               JOIN clients  c ON c.id = p.client_id
+               JOIN currencies cur ON cur.id = i.currency_id
+              WHERE i.supplier_id = ?
+                AND i.status != 'cancelled'
+                AND i.invoice_type != 'cancellation'
+                AND cur.code = ?
+                AND YEAR(COALESCE(i.tax_date, i.issue_date)) = ?
+           GROUP BY p.id, p.name, c.company_name
+             HAVING revenue > 0
+           ORDER BY revenue DESC"
+        );
+        $stmt->execute([$sid, $currency, $year]);
+        $all = $stmt->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+
+        $top = array_slice($all, 0, 10);
+        $rest = array_slice($all, 10);
+
+        $top = array_map(fn (array $r) => [
+            'id'                  => (int) $r['id'],
+            'name'                => $r['name'],
+            'client_company_name' => $r['client_company_name'],
+            'revenue'             => (float) $r['revenue'],
+            'invoice_count'       => (int) $r['invoice_count'],
+        ], $top);
+
+        $others = ['revenue' => 0.0, 'count' => 0];
+        foreach ($rest as $r) {
+            $others['revenue'] += (float) $r['revenue'];
+            $others['count']++;
+        }
+        $others['revenue'] = round($others['revenue'], 2);
+
+        return ['top' => $top, 'others' => $others];
+    }
+
+    /** @param int[] $years */
+    private function totalsPerYear(\PDO $pdo, array $years, int $sid): array
+    {
+        $place = implode(',', array_fill(0, count($years), '?'));
+        $stmt = $pdo->prepare(
+            "SELECT YEAR(COALESCE(i.tax_date, i.issue_date)) AS year,
+                    cur.code AS currency,
+                    SUM(i.total_with_vat) AS total,
+                    COUNT(*) AS invoice_count
+               FROM invoices i
+               JOIN currencies cur ON cur.id = i.currency_id
+              WHERE i.supplier_id = ?
+                AND i.status != 'cancelled'
+                AND i.invoice_type != 'cancellation'
+                AND YEAR(COALESCE(i.tax_date, i.issue_date)) IN ($place)
+           GROUP BY year, cur.code
+           ORDER BY year DESC, total DESC"
+        );
+        $stmt->execute([$sid, ...$years]);
+        return array_map(fn (array $r) => [
+            'year'          => (int) $r['year'],
+            'currency'      => $r['currency'],
+            'total'         => (float) $r['total'],
+            'invoice_count' => (int) $r['invoice_count'],
+        ], $stmt->fetchAll(\PDO::FETCH_ASSOC) ?: []);
+    }
+
+    private function statusBreakdown(\PDO $pdo, int $sid): array
+    {
+        $stmt = $pdo->prepare(
+            "SELECT p.status, COUNT(*) AS cnt
+               FROM projects p
+               JOIN clients c ON c.id = p.client_id
+              WHERE p.archived_at IS NULL AND c.supplier_id = ?
+           GROUP BY p.status"
+        );
+        $stmt->execute([$sid]);
+        $rows = $stmt->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+        return array_map(fn (array $r) => [
+            'status' => $r['status'],
+            'count'  => (int) $r['cnt'],
+        ], $rows);
+    }
+}

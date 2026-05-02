@@ -1,0 +1,193 @@
+<?php
+
+declare(strict_types=1);
+
+namespace MyInvoice\Action\Invoice;
+
+use MyInvoice\Http\Json;
+use MyInvoice\Http\SupplierGuard;
+use MyInvoice\Infrastructure\Database\Connection;
+use MyInvoice\Middleware\AuthMiddleware;
+use MyInvoice\Repository\InvoiceRepository;
+use MyInvoice\Service\ActivityLogger;
+use MyInvoice\Service\Invoice\InvoiceCalculator;
+use MyInvoice\Service\IpMatcher;
+use MyInvoice\Service\Stats\StatsRecomputer;
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+
+/**
+ * Storno vystavené faktury. Dvě varianty:
+ *
+ *  - mode=internal      → vytvoří `cancellation` záznam s parent. Původní invoice
+ *                         dostane `cancelled_at` a status='cancelled'. Žádný doklad
+ *                         pro klienta.
+ *
+ *  - mode=credit_note   → vytvoří DRAFT typu `credit_note` se zápornými položkami.
+ *                         User musí v editoru zkontrolovat a zavolat /issue.
+ *                         Původní status zůstává až do vystavení dobropisu.
+ */
+final class CancelInvoiceAction
+{
+    public function __construct(
+        private readonly InvoiceRepository $repo,
+        private readonly Connection $db,
+        private readonly InvoiceCalculator $calc,
+        private readonly ActivityLogger $logger,
+        private readonly IpMatcher $ipMatcher,
+        private readonly StatsRecomputer $stats,
+    ) {}
+
+    public function __invoke(Request $request, Response $response, array $args): Response
+    {
+        $id = (int) ($args['id'] ?? 0);
+        $invoice = $this->repo->find($id);
+        if (!SupplierGuard::owns($request, $invoice)) {
+            return Json::error($response, 'not_found', 'Faktura nenalezena.', 404);
+        }
+        if (!in_array($invoice['status'], ['issued', 'sent', 'reminded', 'paid'], true)) {
+            return Json::error($response, 'invalid_state', 'Lze zrušit jen vystavenou/odeslanou/zaplacenou fakturu.', 409);
+        }
+        if (in_array($invoice['invoice_type'], ['credit_note', 'cancellation'], true)) {
+            return Json::error($response, 'invalid_type', 'Dobropis ani storno nelze stornovat.', 409);
+        }
+
+        $body = (array) ($request->getParsedBody() ?? []);
+        $mode = (string) ($body['mode'] ?? '');
+        $reason = (string) ($body['reason'] ?? '');
+
+        if ($mode === 'internal') {
+            return $this->internalCancel($request, $response, $invoice, $reason);
+        }
+        if ($mode === 'credit_note') {
+            return $this->createCreditNote($request, $response, $invoice, $reason);
+        }
+
+        return Json::error($response, 'invalid_mode', 'mode musí být "internal" nebo "credit_note".', 400);
+    }
+
+    private function internalCancel(Request $request, Response $response, array $invoice, string $reason): Response
+    {
+        $pdo = $this->db->pdo();
+        $user = (array) $request->getAttribute(AuthMiddleware::ATTR_USER, []);
+        $userId = (int) ($user['id'] ?? 0);
+
+        $pdo->beginTransaction();
+        try {
+            // 1. Vytvoř cancellation záznam (interní, bez varsymbolu)
+            $stmt = $pdo->prepare(
+                'INSERT INTO invoices
+                   (invoice_type, parent_invoice_id, client_id, project_id, supplier_id,
+                    issue_date, tax_date, due_date, currency_id, language,
+                    note_above_items, status, created_by)
+                 VALUES ("cancellation", ?, ?, ?, ?, CURDATE(), NULL, CURDATE(), ?, ?, ?, "issued", ?)'
+            );
+            $stmt->execute([
+                $invoice['id'],
+                $invoice['client_id'],
+                $invoice['project_id'],
+                (int) $invoice['supplier_id'],
+                (int) $invoice['currency_id'],
+                $invoice['language'],
+                $reason !== '' ? "Storno faktury {$invoice['varsymbol']}: $reason" : null,
+                $userId,
+            ]);
+            $cancellationId = (int) $pdo->lastInsertId();
+
+            // 2. Označ původní fakturu jako cancelled
+            $pdo->prepare('UPDATE invoices SET status = "cancelled", cancelled_at = NOW() WHERE id = ?')
+                ->execute([$invoice['id']]);
+
+            $pdo->commit();
+        } catch (\Throwable $e) {
+            $pdo->rollBack();
+            return Json::error($response, 'cancel_failed', $e->getMessage(), 500);
+        }
+
+        $ip = $this->ipMatcher->clientIpFromRequest($request->getServerParams());
+        $this->logger->log('invoice.cancelled', $userId, 'invoice', $invoice['id'], [
+            'mode' => 'internal',
+            'cancellation_id' => $cancellationId,
+            'reason' => $reason,
+        ], $ip, $request->getHeaderLine('User-Agent'));
+
+        // Stornovaná faktura odejde z revenue cache
+        $this->stats->recomputeForInvoiceId((int) $invoice['id']);
+
+        return Json::ok($response, [
+            'cancellation_id' => $cancellationId,
+            'invoice'         => $this->repo->find($invoice['id']),
+        ]);
+    }
+
+    private function createCreditNote(Request $request, Response $response, array $invoice, string $reason): Response
+    {
+        $pdo = $this->db->pdo();
+        $user = (array) $request->getAttribute(AuthMiddleware::ATTR_USER, []);
+        $userId = (int) ($user['id'] ?? 0);
+
+        $pdo->beginTransaction();
+        try {
+            $stmt = $pdo->prepare(
+                'INSERT INTO invoices
+                   (invoice_type, parent_invoice_id, client_id, project_id, supplier_id,
+                    issue_date, tax_date, due_date, currency_id, reverse_charge, language,
+                    note_above_items, status, created_by)
+                 VALUES ("credit_note", ?, ?, ?, ?, CURDATE(), CURDATE(), CURDATE(), ?, ?, ?, ?, "draft", ?)'
+            );
+            $stmt->execute([
+                $invoice['id'],
+                $invoice['client_id'],
+                $invoice['project_id'],
+                (int) $invoice['supplier_id'],
+                (int) $invoice['currency_id'],
+                $invoice['reverse_charge'] ? 1 : 0,
+                $invoice['language'],
+                $reason !== '' ? "Dobropis k faktuře {$invoice['varsymbol']}: $reason" : "Dobropis k faktuře {$invoice['varsymbol']}",
+                $userId,
+            ]);
+            $creditNoteId = (int) $pdo->lastInsertId();
+
+            // Zkopíruj položky se zápornými quantities
+            $itemStmt = $pdo->prepare(
+                'INSERT INTO invoice_items
+                   (invoice_id, description, quantity, unit, unit_price_without_vat,
+                    vat_rate_id, vat_rate_snapshot,
+                    total_without_vat, total_vat, total_with_vat, order_index)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?)'
+            );
+            foreach ($invoice['items'] as $item) {
+                $itemStmt->execute([
+                    $creditNoteId,
+                    $item['description'],
+                    -1 * (float) $item['quantity'],   // záporné množství
+                    $item['unit'],
+                    $item['unit_price_without_vat'],
+                    $item['vat_rate_id'],
+                    $item['vat_rate_snapshot'],
+                    $item['order_index'],
+                ]);
+            }
+
+            $pdo->commit();
+        } catch (\Throwable $e) {
+            $pdo->rollBack();
+            return Json::error($response, 'credit_note_failed', $e->getMessage(), 500);
+        }
+
+        // Recompute sumy nového dobropisu
+        $this->calc->recompute($creditNoteId);
+
+        $ip = $this->ipMatcher->clientIpFromRequest($request->getServerParams());
+        $this->logger->log('invoice.credit_note_created', $userId, 'invoice', $invoice['id'], [
+            'credit_note_id' => $creditNoteId,
+            'reason'         => $reason,
+        ], $ip, $request->getHeaderLine('User-Agent'));
+
+        // Credit note je draft (revenue se nepočítá), ale parent dostal cancelled stav až po issue dobropisu — nepřepočítáváme tady.
+        return Json::ok($response, [
+            'credit_note_id' => $creditNoteId,
+            'edit_url'       => "/invoices/$creditNoteId/edit",
+        ], 201);
+    }
+}

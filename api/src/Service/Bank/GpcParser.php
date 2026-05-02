@@ -1,0 +1,196 @@
+<?php
+
+declare(strict_types=1);
+
+namespace MyInvoice\Service\Bank;
+
+/**
+ * GPC/ABO parser — český formát bankovního výpisu.
+ *
+ * Záznamy jsou fixed-width řádky, identifikované 3-digit prefixem:
+ *   074 — statement header (account, date, balance)
+ *   075 — transaction (amount, VS, KS, SS, counterparty)
+ *
+ * Detail layoutu: viz https://www.gpcsoft.cz/gpc-format/
+ *
+ * Vrací: ['header' => [...], 'transactions' => [...]]
+ */
+final class GpcParser
+{
+    public function parse(string $content): array
+    {
+        // GPC je v CP1250 (Windows Czech). Převod na UTF-8.
+        if (!mb_check_encoding($content, 'UTF-8')) {
+            $content = @iconv('CP1250', 'UTF-8//TRANSLIT', $content) ?: $content;
+        }
+        $lines = preg_split('/\r\n|\n|\r/', $content);
+        $header = null;
+        $transactions = [];
+
+        foreach ($lines as $line) {
+            if ($line === '' || strlen($line) < 3) continue;
+            $type = substr($line, 0, 3);
+            if ($type === '074') {
+                $header = $this->parseHeader($line);
+            } elseif ($type === '075') {
+                $transactions[] = $this->parseTransaction($line);
+            }
+        }
+
+        if ($header === null) {
+            throw new \RuntimeException('GPC: chybí header (074 řádek).');
+        }
+
+        return ['header' => $header, 'transactions' => $transactions];
+    }
+
+    /**
+     * Layout 074 (statement header):
+     *   1-3     "074"
+     *   4-19    account number (16)
+     *   20-39   account name (20)
+     *   40-45   old balance date DDMMYY (6)
+     *   46-59   old balance value v haléřích (14)
+     *   60      old balance sign (+ / -)
+     *   61-74   new balance value (14)
+     *   75      new balance sign
+     *   76-89   debit total (14)
+     *   90      debit sign
+     *   91-104  credit total (14)
+     *   105     credit sign
+     *   106-108 statement number (3)
+     *   109-114 statement date DDMMYY (6)
+     *
+     * Reference: https://github.com/mbursa/gpc2csv (oficiální Python parser).
+     */
+    private function parseHeader(string $line): array
+    {
+        $pad = str_pad($line, 128, ' ');
+        $accountNumber = trim(substr($pad, 3, 16));
+        // Statement date je na pozici 108-114 (DDMMYY); pos 39-45 je old_balance_date.
+        $statementDate = $this->parseDate(trim(substr($pad, 108, 6)));
+        // Pozn.: balance sign je BYTE PŘED hodnotou v pythonu — substr(59,1) + substr(45,14) — viz reference.
+        $prevBalance = $this->parseAmountWithSign(substr($pad, 45, 14), substr($pad, 59, 1));
+        $currBalance = $this->parseAmountWithSign(substr($pad, 60, 14), substr($pad, 74, 1));
+        $debitTotal  = $this->parseAmountWithSign(substr($pad, 75, 14), substr($pad, 89, 1));
+        $creditTotal = $this->parseAmountWithSign(substr($pad, 90, 14), substr($pad, 104, 1));
+        $statementNumber = trim(substr($pad, 105, 3));
+
+        return [
+            'account_number'   => $accountNumber,
+            'statement_date'   => $statementDate,
+            'statement_number' => $statementNumber,
+            'prev_balance'     => $prevBalance,
+            'curr_balance'     => $currBalance,
+            'debit_total'      => $debitTotal,
+            'credit_total'     => $creditTotal,
+        ];
+    }
+
+    /**
+     * Layout 075 (transaction record):
+     *   1-3     "075"
+     *   4-19    own account (16)
+     *   20-35   counterparty account (16)
+     *   36-48   document number / record_number (13)
+     *   49-60   amount v haléřích (12)
+     *   61      posting code: 1=debit, 2=credit, 4=debit_storno, 5=credit_storno
+     *   62-71   variable symbol (10)
+     *   72-73   filler (2)
+     *   74-77   counterparty bank code (4)            ← MEZI VS A KS!
+     *   78-81   constant symbol (4)                   ← KS je jen 4 znaky
+     *   82-91   specific symbol (10)
+     *   92-97   filler / value_date (6)
+     *   98-117  client_name / description (20)
+     *   118-122 currency code (5)
+     *   123-128 posting date DDMMYY (6)
+     *
+     * Reference: https://github.com/mbursa/gpc2csv (oficiální Python parser).
+     */
+    private function parseTransaction(string $line): array
+    {
+        $pad = str_pad($line, 160, ' ');
+        $counterpartyAccount = trim(substr($pad, 19, 16));
+        $amountCents = (int) trim(substr($pad, 48, 12));
+        $postingCode = trim(substr($pad, 60, 1));
+        $vs = trim(substr($pad, 61, 10), " 0");
+        if ($vs === '') $vs = trim(substr($pad, 61, 10));
+        $bankCode = trim(substr($pad, 73, 4));   // pozice 74-77 (1-based)
+        $ks = trim(substr($pad, 77, 4), " 0");   // pozice 78-81, jen 4 znaky
+        if ($ks === '') $ks = trim(substr($pad, 77, 4));
+        $ss = trim(substr($pad, 81, 10), " 0");
+        if ($ss === '') $ss = trim(substr($pad, 81, 10));
+        $description = trim(substr($pad, 97, 20));   // pozice 98-117 (client_name)
+        $currency = trim(substr($pad, 117, 5));      // pozice 118-122 (currency code)
+        $postedAt = $this->parseDate(trim(substr($pad, 122, 6)));   // pozice 123-128 DDMMYY
+
+        $amount = $amountCents / 100.0;
+        // Posting code: 1=debit (-), 2=credit (+), 4=storno debit (+), 5=storno credit (-)
+        if (in_array($postingCode, ['1', '4'], true)) {
+            $amount = -$amount;
+        }
+        // 4 = storno debit (vrácení odchozí) → +; 5 = storno credit (vrácení příchozí) → -
+        if ($postingCode === '4') $amount = abs($amount);
+        if ($postingCode === '5') $amount = -abs($amount);
+
+        // Currency je 5-char ISO numeric (203 = CZK, 978 = EUR, …) nebo prázdné.
+        // Některé banky tam dají alpha "CZK", jiné nechají prázdné — normalizujeme.
+        $currencyCode = $this->normalizeCurrency($currency);
+
+        return [
+            'posted_at'            => $postedAt,
+            'amount'               => round($amount, 2),
+            'currency'             => $currencyCode,
+            'variable_symbol'      => $vs ?: null,
+            'constant_symbol'      => $ks ?: null,
+            'specific_symbol'      => $ss ?: null,
+            'counterparty_account' => $counterpartyAccount ?: null,
+            'counterparty_bank'    => $bankCode ?: null,
+            'counterparty_name'    => $description ?: null,  // GPC client_name = jméno protistrany
+            'description'          => $description ?: null,
+            'bank_ref'             => null,
+        ];
+    }
+
+    /**
+     * GPC numeric currency code (ISO 4217 numeric) → ISO 4217 alpha (CZK / EUR / USD …).
+     * Některé banky vrací alpha přímo. Vrací NULL pokud nelze rozpoznat.
+     */
+    private function normalizeCurrency(string $raw): ?string
+    {
+        $raw = trim($raw);
+        if ($raw === '') return null;
+        if (preg_match('/^[A-Z]{3}$/', $raw)) return $raw;
+        // GPC ukládá ISO numeric jako zero-padded "00203" — strip leading zeros pro lookup.
+        $stripped = ltrim($raw, '0');
+        if ($stripped === '') return null;
+        $map = [
+            '203' => 'CZK', '978' => 'EUR', '840' => 'USD', '826' => 'GBP',
+            '756' => 'CHF', '985' => 'PLN', '348' => 'HUF', '946' => 'RON',
+            '208' => 'DKK', '752' => 'SEK', '578' => 'NOK', '124' => 'CAD',
+            '36'  => 'AUD', '392' => 'JPY',
+        ];
+        return $map[$stripped] ?? null;
+    }
+
+    private function parseAmountWithSign(string $rawAmount, string $sign): float
+    {
+        $cents = (int) trim($rawAmount);
+        $val = $cents / 100.0;
+        return ($sign === '-') ? -$val : $val;
+    }
+
+    /**
+     * GPC datum DDMMYY. Roky 50-99 = 19xx, 00-49 = 20xx.
+     */
+    private function parseDate(string $ddmmyy): ?string
+    {
+        if (!preg_match('/^\d{6}$/', $ddmmyy)) return null;
+        $d = (int) substr($ddmmyy, 0, 2);
+        $m = (int) substr($ddmmyy, 2, 2);
+        $y = (int) substr($ddmmyy, 4, 2);
+        $year = $y >= 50 ? (1900 + $y) : (2000 + $y);
+        if ($m < 1 || $m > 12 || $d < 1 || $d > 31) return null;
+        return sprintf('%04d-%02d-%02d', $year, $m, $d);
+    }
+}

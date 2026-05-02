@@ -1,0 +1,200 @@
+<?php
+
+declare(strict_types=1);
+
+namespace MyInvoice\Action\Invoice;
+
+use MyInvoice\Http\Json;
+use MyInvoice\Http\SupplierGuard;
+use MyInvoice\Infrastructure\Database\Connection;
+use MyInvoice\Middleware\AuthMiddleware;
+use MyInvoice\Repository\InvoiceRepository;
+use MyInvoice\Service\ActivityLogger;
+use MyInvoice\Service\Invoice\InvoiceCalculator;
+use MyInvoice\Service\IpMatcher;
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+
+/**
+ * Hromadně klonuje označené faktury do dalšího měsíce — vytvoří DRAFTy.
+ *
+ * Body:
+ *   {
+ *     "invoice_ids": [101, 102, 103],
+ *     "increment_month_in_descriptions": true,
+ *     "issue_date": null  // null = today
+ *   }
+ *
+ * Pro každou source fakturu:
+ *   - vytvoří draft (status='draft', varsymbol=null)
+ *   - kopie items + work_report (zatím work_report ne — M5)
+ *   - auto-increment měsíce v popisech (regex /\b(\d{1,2})\/(\d{4})\b/)
+ *   - tax_date/due_date = today (nebo +project.payment_due_days)
+ *
+ * Žádný draft se neodesílá ani nevystavuje. User musí každý ručně otevřít.
+ */
+final class BulkReissueAction
+{
+    public function __construct(
+        private readonly InvoiceRepository $repo,
+        private readonly Connection $db,
+        private readonly InvoiceCalculator $calc,
+        private readonly ActivityLogger $logger,
+        private readonly IpMatcher $ipMatcher,
+    ) {}
+
+    public function __invoke(Request $request, Response $response): Response
+    {
+        $body = (array) ($request->getParsedBody() ?? []);
+        $ids = (array) ($body['invoice_ids'] ?? []);
+        $incrementMonth = (bool) ($body['increment_month_in_descriptions'] ?? true);
+        $issueDate = isset($body['issue_date']) && $body['issue_date'] !== null && $body['issue_date'] !== ''
+            ? (string) $body['issue_date']
+            : date('Y-m-d');
+
+        if (empty($ids)) {
+            return Json::error($response, 'no_invoices', 'Není vybrána žádná faktura.', 400);
+        }
+
+        $user = (array) $request->getAttribute(AuthMiddleware::ATTR_USER, []);
+        $userId = (int) ($user['id'] ?? 0);
+
+        $created = [];
+        $errors = [];
+
+        foreach ($ids as $sourceId) {
+            $sourceId = (int) $sourceId;
+            // Ownership: nedovol klonovat cizí faktury
+            if (!SupplierGuard::owns($request, $this->repo->find($sourceId))) {
+                $errors[] = ['source_id' => $sourceId, 'error' => 'not_found'];
+                continue;
+            }
+            try {
+                $newId = $this->cloneOne($sourceId, $issueDate, $incrementMonth, $userId);
+                $created[] = ['source_id' => $sourceId, 'draft_id' => $newId];
+            } catch (\Throwable $e) {
+                $errors[] = ['source_id' => $sourceId, 'error' => $e->getMessage()];
+            }
+        }
+
+        $ip = $this->ipMatcher->clientIpFromRequest($request->getServerParams());
+        $this->logger->log('invoice.reissued_bulk', $userId, null, null, [
+            'source_count'  => count($ids),
+            'created_count' => count($created),
+            'error_count'   => count($errors),
+            'increment_month' => $incrementMonth,
+        ], $ip, $request->getHeaderLine('User-Agent'));
+
+        return Json::ok($response, [
+            'created' => $created,
+            'errors'  => $errors,
+        ], 201);
+    }
+
+    public function cloneOne(int $sourceId, string $issueDate, bool $incrementMonth, int $userId): int
+    {
+        $source = $this->repo->find($sourceId);
+        if ($source === null) {
+            throw new \RuntimeException("Faktura #$sourceId nenalezena");
+        }
+
+        $type = $source['invoice_type'] === 'proforma' ? 'proforma' : 'invoice';
+
+        // Default due_date podle project nebo +14
+        $dueDate = $issueDate;
+        if (!empty($source['project_id'])) {
+            $stmt = $this->db->pdo()->prepare('SELECT payment_due_days FROM projects WHERE id = ?');
+            $stmt->execute([$source['project_id']]);
+            $days = (int) $stmt->fetchColumn();
+            if ($days > 0) {
+                $dueDate = date('Y-m-d', strtotime($issueDate . " +{$days} days"));
+            }
+        }
+
+        $taxDate = $type === 'proforma' ? null : $issueDate;
+
+        $pdo = $this->db->pdo();
+        $pdo->beginTransaction();
+        try {
+            $stmt = $pdo->prepare(
+                'INSERT INTO invoices
+                   (invoice_type, client_id, project_id, supplier_id,
+                    issue_date, tax_date, due_date, currency_id, reverse_charge, language,
+                    note_above_items, note_below_items, status, created_by)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "draft", ?)'
+            );
+            $stmt->execute([
+                $type,
+                $source['client_id'],
+                $source['project_id'],
+                (int) $source['supplier_id'],
+                $issueDate,
+                $taxDate,
+                $dueDate,
+                (int) $source['currency_id'],
+                $source['reverse_charge'] ? 1 : 0,
+                $source['language'],
+                $source['note_above_items'],
+                $source['note_below_items'],
+                $userId,
+            ]);
+            $newId = (int) $pdo->lastInsertId();
+
+            // Zkopíruj položky s případným inkrementem měsíce
+            $itemStmt = $pdo->prepare(
+                'INSERT INTO invoice_items
+                   (invoice_id, description, quantity, unit, unit_price_without_vat,
+                    vat_rate_id, vat_rate_snapshot,
+                    total_without_vat, total_vat, total_with_vat, order_index)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?)'
+            );
+            foreach ($source['items'] as $item) {
+                $description = $incrementMonth
+                    ? $this->incrementMonthInString((string) $item['description'])
+                    : (string) $item['description'];
+
+                $itemStmt->execute([
+                    $newId,
+                    $description,
+                    $item['quantity'],
+                    $item['unit'],
+                    $item['unit_price_without_vat'],
+                    $item['vat_rate_id'],
+                    $item['vat_rate_snapshot'],
+                    $item['order_index'],
+                ]);
+            }
+
+            $pdo->commit();
+        } catch (\Throwable $e) {
+            $pdo->rollBack();
+            throw $e;
+        }
+
+        $this->calc->recompute($newId);
+        return $newId;
+    }
+
+    /**
+     * "Konzultace 3/2026" → "Konzultace 4/2026"
+     * "Vícepráce 12/2025" → "Vícepráce 1/2026"
+     * "Část 3/2026 a část 5/2026" → "Část 4/2026 a část 6/2026"
+     * "13/2026" → "13/2026" (neplatný měsíc, neměnit)
+     */
+    public function incrementMonthInString(string $text): string
+    {
+        return preg_replace_callback('/\b(\d{1,2})\/(\d{4})\b/', function ($m) {
+            $month = (int) $m[1];
+            $year = (int) $m[2];
+            if ($month < 1 || $month > 12) {
+                return $m[0]; // neplatný měsíc
+            }
+            $month++;
+            if ($month > 12) {
+                $month = 1;
+                $year++;
+            }
+            return "{$month}/{$year}";
+        }, $text) ?? $text;
+    }
+}

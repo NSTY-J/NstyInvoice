@@ -1,0 +1,326 @@
+<?php
+
+declare(strict_types=1);
+
+namespace MyInvoice\Action\Bank;
+
+use MyInvoice\Http\Json;
+use MyInvoice\Http\SupplierGuard;
+use MyInvoice\Infrastructure\Database\Connection;
+use MyInvoice\Middleware\AuthMiddleware;
+use MyInvoice\Repository\InvoiceRepository;
+use MyInvoice\Service\ActivityLogger;
+use MyInvoice\Infrastructure\Config\Config;
+use MyInvoice\Service\Bank\GpcParser;
+use MyInvoice\Service\Bank\StatementImporter;
+use MyInvoice\Service\Bank\StatementMatcher;
+use MyInvoice\Service\Bank\StatementScanner;
+use MyInvoice\Service\IpMatcher;
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+
+/**
+ * Bank statement endpoints (M5b).
+ *
+ *   POST   /api/bank-statements/upload         multipart file=...
+ *   GET    /api/bank-statements                list
+ *   GET    /api/bank-statements/{id}           detail (+ transactions)
+ *   POST   /api/bank-transactions/{id}/match   { invoice_id }  manual match
+ *   POST   /api/bank-transactions/{id}/ignore  mark as ignored
+ */
+final class BankStatementAction
+{
+    public function __construct(
+        private readonly Connection $db,
+        private readonly StatementImporter $importer,
+        private readonly StatementMatcher $matcher,
+        private readonly StatementScanner $scanner,
+        private readonly Config $config,
+        private readonly ActivityLogger $logger,
+        private readonly IpMatcher $ipMatcher,
+        private readonly InvoiceRepository $invoices,
+        private readonly GpcParser $parser,
+    ) {}
+
+    public function scan(Request $request, Response $response): Response
+    {
+        $user = (array) $request->getAttribute(AuthMiddleware::ATTR_USER, []);
+        if (($user['role'] ?? '') !== 'admin') {
+            return Json::error($response, 'forbidden', 'Pouze admin.', 403);
+        }
+        $root = (string) $this->config->get('bank_import.scan_root', '');
+        if ($root === '' || !is_dir($root)) {
+            return Json::error($response, 'config_missing', 'cfg.bank_import.scan_root není nastaveno nebo adresář neexistuje.', 400);
+        }
+        $summary = $this->scanner->scan($root);
+        $ip = $this->ipMatcher->clientIpFromRequest($request->getServerParams());
+        $this->logger->log('bank.scanned', $user['id'] ?? null, null, null, $summary, $ip, $request->getHeaderLine('User-Agent'));
+        return Json::ok($response, $summary);
+    }
+
+    public function upload(Request $request, Response $response): Response
+    {
+        $user = (array) $request->getAttribute(AuthMiddleware::ATTR_USER, []);
+        if (!in_array(($user['role'] ?? ''), ['admin', 'accountant'], true)) {
+            return Json::error($response, 'forbidden', 'Pouze admin nebo účetní.', 403);
+        }
+
+        $files = $request->getUploadedFiles();
+        $file = $files['file'] ?? null;
+        if (!$file || $file->getError() !== UPLOAD_ERR_OK) {
+            return Json::error($response, 'no_file', 'Soubor chybí.', 400);
+        }
+
+        // Limit velikosti — GPC výpisy bývají max stovky kB. 5 MiB je více než dost a chrání před DoS.
+        $maxSize = 5 * 1024 * 1024;
+        if (($file->getSize() ?? 0) > $maxSize) {
+            return Json::error($response, 'file_too_large', 'Soubor je příliš velký (max 5 MiB).', 413);
+        }
+
+        // Whitelist přípon dle cfg.bank_import.allowed_exts
+        $name = (string) $file->getClientFilename();
+        $allowedExts = (array) $this->config->get('bank_import.allowed_exts', ['gpc', 'txt']);
+        $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+        if ($ext === '' || !in_array($ext, $allowedExts, true)) {
+            return Json::error($response, 'invalid_extension', 'Nepovolená přípona souboru. Povolené: ' . implode(', ', $allowedExts), 400);
+        }
+
+        $content = (string) $file->getStream()->getContents();
+        if (strlen($content) < 50) {
+            return Json::error($response, 'empty_file', 'Soubor je prázdný.', 400);
+        }
+
+        // MIME check — GPC/ABO je plain text, odmítneme cokoliv binárního.
+        // PHP 8.5+ deprecates finfo_close() (resource je auto-freed), proto ho neuvádíme.
+        if (function_exists('finfo_buffer')) {
+            $finfo = finfo_open(FILEINFO_MIME_TYPE);
+            if ($finfo !== false) {
+                $mime = (string) finfo_buffer($finfo, $content);
+                if ($mime !== '' && !str_starts_with($mime, 'text/') && $mime !== 'application/octet-stream') {
+                    return Json::error($response, 'invalid_mime', 'Soubor není textový (detekováno: ' . $mime . ').', 400);
+                }
+            }
+        }
+
+        // MS-P2-1: parse hlavičku, ověř že account_number patří currencies aktuálního supplieru
+        try {
+            $parsed = $this->parser->parse($content);
+        } catch (\Throwable $e) {
+            return Json::error($response, 'parse_failed', 'Nelze parsovat: ' . $e->getMessage(), 400);
+        }
+        $accountNumber = (string) ($parsed['header']['account_number'] ?? '');
+        if ($accountNumber !== '') {
+            $sid = SupplierGuard::currentId($request);
+            $stmt = $this->db->pdo()->prepare(
+                'SELECT account_number FROM currencies WHERE supplier_id = ? AND account_number IS NOT NULL'
+            );
+            $stmt->execute([$sid]);
+            $found = false;
+            foreach ($stmt->fetchAll(\PDO::FETCH_COLUMN) as $stored) {
+                if (\MyInvoice\Service\Bank\AccountNumberNormalizer::equals((string) $stored, $accountNumber)) {
+                    $found = true;
+                    break;
+                }
+            }
+            if (!$found) {
+                return Json::error(
+                    $response,
+                    'wrong_supplier_account',
+                    "Bankovní účet $accountNumber není registrovaný u aktuálního supplier (Settings → měny → bankovní spojení).",
+                    409
+                );
+            }
+        }
+
+        try {
+            $r = $this->importer->import($content, $name, (int) ($user['id'] ?? 0));
+        } catch (\Throwable $e) {
+            return Json::error($response, 'parse_failed', 'Nelze parsovat: ' . $e->getMessage(), 400);
+        }
+
+        $ip = $this->ipMatcher->clientIpFromRequest($request->getServerParams());
+        $this->logger->log('bank.statement_imported', $user['id'] ?? null, 'bank_statement', $r['statement_id'], $r, $ip, $request->getHeaderLine('User-Agent'));
+
+        return Json::ok($response, $r);
+    }
+
+    public function list(Request $request, Response $response): Response
+    {
+        // Multi-supplier scope: filter podle (account_number, bank_code) z currencies aktuálního supplier.
+        // GPC zero-paduje účet (`0000001000000005`), currencies bez padding (`1000000005`) — porovnáváme
+        // normalizované hodnoty (REGEXP_REPLACE non-digits + TRIM leading zeros).
+        $sid = SupplierGuard::currentId($request);
+        $stmt = $this->db->pdo()->prepare(
+            "SELECT bs.id, bs.file_name, bs.account_number, bs.statement_date, bs.statement_number,
+                    bs.prev_balance, bs.curr_balance, bs.transaction_count, bs.matched_count, bs.imported_at
+               FROM bank_statements bs
+              WHERE EXISTS (
+                  SELECT 1 FROM currencies cur
+                   WHERE cur.supplier_id = ?
+                     AND TRIM(LEADING '0' FROM REGEXP_REPLACE(IFNULL(cur.account_number, ''), '[^0-9]', ''))
+                       = TRIM(LEADING '0' FROM REGEXP_REPLACE(IFNULL(bs.account_number, ''),  '[^0-9]', ''))
+                     AND (bs.bank_code IS NULL OR cur.bank_code IS NULL OR cur.bank_code = bs.bank_code)
+              )
+              ORDER BY bs.statement_date DESC, bs.id DESC
+              LIMIT 200"
+        );
+        $stmt->execute([$sid]);
+        $rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+        foreach ($rows as &$r) {
+            $r['id'] = (int) $r['id'];
+            $r['transaction_count'] = (int) $r['transaction_count'];
+            $r['matched_count'] = (int) $r['matched_count'];
+            $r['prev_balance'] = (float) $r['prev_balance'];
+            $r['curr_balance'] = (float) $r['curr_balance'];
+        }
+        return Json::ok($response, $rows);
+    }
+
+    public function detail(Request $request, Response $response, array $args): Response
+    {
+        $id = (int) ($args['id'] ?? 0);
+        $sid = SupplierGuard::currentId($request);
+        // Normalize porovnání account_number — viz `list()` komentář.
+        $stmt = $this->db->pdo()->prepare(
+            "SELECT bs.* FROM bank_statements bs
+              WHERE bs.id = ?
+                AND EXISTS (
+                  SELECT 1 FROM currencies cur
+                   WHERE cur.supplier_id = ?
+                     AND TRIM(LEADING '0' FROM REGEXP_REPLACE(IFNULL(cur.account_number, ''), '[^0-9]', ''))
+                       = TRIM(LEADING '0' FROM REGEXP_REPLACE(IFNULL(bs.account_number, ''),  '[^0-9]', ''))
+                     AND (bs.bank_code IS NULL OR cur.bank_code IS NULL OR cur.bank_code = bs.bank_code)
+                )"
+        );
+        $stmt->execute([$id, $sid]);
+        $s = $stmt->fetch(\PDO::FETCH_ASSOC);
+        if (!$s) return Json::error($response, 'not_found', 'Výpis nenalezen.', 404);
+
+        $txStmt = $this->db->pdo()->prepare(
+            'SELECT bt.*, i.varsymbol AS matched_varsymbol, i.amount_to_pay AS matched_invoice_amount,
+                    i.client_id, c.company_name AS matched_client_name
+               FROM bank_transactions bt
+          LEFT JOIN invoices i ON i.id = bt.matched_invoice_id
+          LEFT JOIN clients c ON c.id = i.client_id
+              WHERE bt.statement_id = ?
+           ORDER BY bt.posted_at, bt.id'
+        );
+        $txStmt->execute([$id]);
+        $transactions = $txStmt->fetchAll(\PDO::FETCH_ASSOC);
+        foreach ($transactions as &$t) {
+            $t['id'] = (int) $t['id'];
+            $t['amount'] = (float) $t['amount'];
+            $t['matched_invoice_id'] = $t['matched_invoice_id'] !== null ? (int) $t['matched_invoice_id'] : null;
+        }
+        $s['id'] = (int) $s['id'];
+        $s['transactions'] = $transactions;
+        return Json::ok($response, $s);
+    }
+
+    public function manualMatch(Request $request, Response $response, array $args): Response
+    {
+        $txId = (int) ($args['id'] ?? 0);
+        $body = (array) ($request->getParsedBody() ?? []);
+        $invoiceId = (int) ($body['invoice_id'] ?? 0);
+        $varsymbol = trim((string) ($body['varsymbol'] ?? ''));
+
+        // Pokud uživatel poslal varsymbol místo invoice_id, najdi fakturu v supplier scope.
+        if ($invoiceId <= 0 && $varsymbol !== '') {
+            $sid = SupplierGuard::currentId($request);
+            $stmt = $this->db->pdo()->prepare(
+                'SELECT id FROM invoices WHERE supplier_id = ? AND varsymbol = ? LIMIT 1'
+            );
+            $stmt->execute([$sid, $varsymbol]);
+            $invoiceId = (int) $stmt->fetchColumn();
+            if ($invoiceId <= 0) {
+                return Json::error($response, 'invoice_not_found', "Faktura s VS '$varsymbol' nenalezena.", 404);
+            }
+        }
+
+        if ($invoiceId <= 0) {
+            return Json::error($response, 'validation_failed', 'Chybí invoice_id nebo varsymbol.', 400);
+        }
+
+        // Faktura musí patřit aktuálnímu supplier (anti cross-supplier match)
+        $invoice = $this->invoices->find($invoiceId);
+        if (!SupplierGuard::owns($request, $invoice)) {
+            return Json::error($response, 'invoice_not_found', 'Faktura nenalezena.', 404);
+        }
+
+        $pdo = $this->db->pdo();
+
+        // Načti transakci pro posted_at (datum úhrady ze skutečnosti, ne dnes) + statement_id
+        $tx = $pdo->prepare('SELECT posted_at, statement_id FROM bank_transactions WHERE id = ?');
+        $tx->execute([$txId]);
+        $txRow = $tx->fetch(\PDO::FETCH_ASSOC) ?: [];
+        $postedAt = (string) ($txRow['posted_at'] ?? date('Y-m-d'));
+        $statementId = (int) ($txRow['statement_id'] ?? 0);
+
+        $userId = (int) (((array) $request->getAttribute(AuthMiddleware::ATTR_USER, []))['id'] ?? 0);
+
+        $pdo->beginTransaction();
+        try {
+            $pdo->prepare(
+                "UPDATE bank_transactions
+                    SET matched_invoice_id = ?, match_status = 'manual', matched_at = NOW(), matched_by = ?
+                  WHERE id = ?"
+            )->execute([$invoiceId, $userId ?: null, $txId]);
+
+            // Pokud faktura ještě není paid/cancelled, označ ji jako paid s datem z výpisu
+            if (in_array($invoice['status'], ['issued', 'sent', 'reminded'], true)) {
+                $pdo->prepare(
+                    "UPDATE invoices SET status = 'paid', paid_at = ? WHERE id = ?"
+                )->execute([$postedAt, $invoiceId]);
+            }
+
+            // Recompute matched_count na výpisu (pro UI badge "12/14")
+            if ($statementId > 0) {
+                $pdo->prepare(
+                    "UPDATE bank_statements
+                        SET matched_count = (
+                            SELECT COUNT(*) FROM bank_transactions
+                             WHERE statement_id = ?
+                               AND match_status IN ('auto_exact', 'auto_partial', 'manual')
+                        )
+                      WHERE id = ?"
+                )->execute([$statementId, $statementId]);
+            }
+            $pdo->commit();
+        } catch (\Throwable $e) {
+            $pdo->rollBack();
+            return Json::error($response, 'match_failed', 'Manuální párování selhalo: ' . $e->getMessage(), 500);
+        }
+
+        $ip = $this->ipMatcher->clientIpFromRequest($request->getServerParams());
+        $this->logger->log('bank.tx_manual_match', $userId ?: null, 'bank_transaction', $txId, [
+            'invoice_id' => $invoiceId,
+            'paid_at'    => $postedAt,
+        ], $ip, $request->getHeaderLine('User-Agent'));
+        return Json::ok($response, ['matched' => true, 'paid_at' => $postedAt]);
+    }
+
+    public function ignore(Request $request, Response $response, array $args): Response
+    {
+        $txId = (int) ($args['id'] ?? 0);
+        $pdo = $this->db->pdo();
+        $stmt = $pdo->prepare('SELECT statement_id FROM bank_transactions WHERE id = ?');
+        $stmt->execute([$txId]);
+        $statementId = (int) $stmt->fetchColumn();
+
+        $pdo->prepare("UPDATE bank_transactions SET match_status = 'ignored' WHERE id = ?")->execute([$txId]);
+
+        // Pokud byla transakce dříve matched (auto/manual), recompute count na výpisu
+        if ($statementId > 0) {
+            $pdo->prepare(
+                "UPDATE bank_statements
+                    SET matched_count = (
+                        SELECT COUNT(*) FROM bank_transactions
+                         WHERE statement_id = ?
+                           AND match_status IN ('auto_exact', 'auto_partial', 'manual')
+                    )
+                  WHERE id = ?"
+            )->execute([$statementId, $statementId]);
+        }
+        return Json::ok($response, ['ignored' => true]);
+    }
+}

@@ -1,0 +1,18 @@
+MyInvoice.cz — {{ locale == 'en' ? 'Invoicing system' : 'Fakturační systém' }}
+================================
+
+{% block content %}{% endblock %}
+
+{% if supplier %}
+--
+{% if supplier.display_name %}{{ supplier.display_name }}
+{% endif %}{% if supplier.tagline %}{{ supplier.tagline }}
+{% endif %}{% if supplier.email %}{{ supplier.email }}
+{% endif %}
+{{ supplier.company_name }}
+{{ supplier.street }}
+{{ supplier.zip }} {{ supplier.city }}{% if supplier.country %}, {{ supplier.country }}{% endif %}
+
+{% if supplier.phone %}{{ supplier.phone }}
+{% endif %}{% if supplier.web %}{{ supplier.web }}
+{% endif %}{% endif %}

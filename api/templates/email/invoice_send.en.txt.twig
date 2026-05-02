@@ -1,0 +1,18 @@
+{% extends '_layout.txt.twig' %}
+
+{% block content %}
+{% if is_test %}[TEST] {% endif %}{{ greeting }}
+------------
+
+{{ intro_plain }}
+
+Variable symbol: {{ invoice.varsymbol }}
+Issue date:      {{ invoice.issue_date|date('M j, Y') }}
+Due date:        {{ invoice.due_date|date('M j, Y') }}
+Amount due:      {{ amount_to_pay|number_format(2, '.', ',') }} {{ invoice.currency }}
+
+The invoice PDF is attached.
+
+{% if not is_test %}Thank you for your business.
+{% else %}=== TEST EMAIL — client did not receive it. ==={% endif %}
+{% endblock %}

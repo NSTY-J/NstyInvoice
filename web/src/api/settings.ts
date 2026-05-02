@@ -1,0 +1,96 @@
+import { api } from './client'
+
+export interface Supplier {
+  id: number
+  company_name: string
+  display_name: string | null
+  street: string
+  city: string
+  zip: string
+  country_id: number
+  country_iso?: string
+  country_name_cs?: string
+  country_name_en?: string
+  ic: string | null
+  dic: string | null
+  is_vat_payer: boolean
+  email: string
+  phone: string | null
+  web: string | null
+  tagline: string | null
+  default_currency_id: number
+  default_currency: string
+  default_vat_rate_id: number
+  default_payment_due_days: number
+  default_hourly_rate: number
+  logo_path: string | null
+  signature_path: string | null
+  pohoda_account_code: string | null
+  pohoda_centre_code: string | null
+  pohoda_activity_code: string | null
+  pohoda_contract_code: string | null
+}
+
+export interface CurrencyAccount {
+  id: number
+  code: string
+  label: string
+  symbol: string
+  name_cs: string
+  name_en: string
+  decimals: number
+  is_active: boolean
+  is_default: boolean
+  account_number: string | null
+  bank_code: string | null
+  bank_name: string | null
+  iban: string | null
+  bic: string | null
+  invoices_count?: number
+}
+
+export interface VatRate {
+  id: number
+  code: string
+  rate_percent: number
+  country: string
+  label_cs: string
+  label_en: string
+  is_default: boolean
+  is_reverse_charge: boolean
+  valid_from: string
+  valid_to: string | null
+  items_count?: number
+}
+
+export interface Country {
+  id: number
+  iso2: string
+  iso3: string
+  name_cs: string
+  name_en: string
+  is_eu: boolean
+  uses_count?: number
+}
+
+export const settingsApi = {
+  getSupplier: () => api.get<Supplier>('/settings/supplier').then(r => r.data),
+  updateSupplier: (payload: Partial<Supplier>) => api.put<Supplier>('/settings/supplier', payload).then(r => r.data),
+
+  listCurrencies: () => api.get<CurrencyAccount[]>('/settings/currencies').then(r => r.data),
+  createCurrency: (payload: Partial<CurrencyAccount>) =>
+    api.post<{ id: number; code: string }>('/settings/currencies', payload).then(r => r.data),
+  updateCurrency: (id: number, payload: Partial<CurrencyAccount>) =>
+    api.put<CurrencyAccount>(`/settings/currencies/${id}`, payload).then(r => r.data),
+  deleteCurrency: (id: number) => api.delete(`/settings/currencies/${id}`).then(r => r.data),
+
+  listVatRates:   () => api.get<VatRate[]>('/settings/vat-rates').then(r => r.data),
+  createVatRate:  (p: Partial<VatRate>) => api.post('/settings/vat-rates', p).then(r => r.data),
+  updateVatRate:  (id: number, p: Partial<VatRate>) => api.put(`/settings/vat-rates/${id}`, p).then(r => r.data),
+  deleteVatRate:  (id: number) => api.delete(`/settings/vat-rates/${id}`).then(r => r.data),
+
+  listCountries:  () => api.get<Country[]>('/settings/countries').then(r => r.data),
+  createCountry:  (p: Partial<Country>) => api.post('/settings/countries', p).then(r => r.data),
+  updateCountry:  (id: number, p: Partial<Country>) => api.put(`/settings/countries/${id}`, p).then(r => r.data),
+  deleteCountry:  (id: number) => api.delete(`/settings/countries/${id}`).then(r => r.data),
+}

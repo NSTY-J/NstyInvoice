@@ -1,0 +1,58 @@
+<?php
+
+declare(strict_types=1);
+
+namespace MyInvoice\Action\Project;
+
+use MyInvoice\Http\Json;
+use MyInvoice\Http\SupplierGuard;
+use MyInvoice\Infrastructure\Database\Connection;
+use MyInvoice\Middleware\AuthMiddleware;
+use MyInvoice\Repository\ProjectRepository;
+use MyInvoice\Service\ActivityLogger;
+use MyInvoice\Service\IpMatcher;
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+
+/**
+ * DELETE /api/projects/{id}
+ * Tvrdé smazání. Selže (409), pokud na zakázce existují faktury.
+ * Pro „soft" odstavení slouží archive endpoint.
+ */
+final class DeleteProjectAction
+{
+    public function __construct(
+        private readonly ProjectRepository $repo,
+        private readonly Connection $db,
+        private readonly ActivityLogger $logger,
+        private readonly IpMatcher $ipMatcher,
+    ) {}
+
+    public function __invoke(Request $request, Response $response, array $args): Response
+    {
+        $id = (int) ($args['id'] ?? 0);
+        if (!SupplierGuard::owns($request, $this->repo->find($id))) {
+            return Json::error($response, 'not_found', 'Zakázka nenalezena.', 404);
+        }
+
+        $count = (int) $this->db->pdo()
+            ->query('SELECT COUNT(*) FROM invoices WHERE project_id = ' . $id)
+            ->fetchColumn();
+        if ($count > 0) {
+            return Json::error(
+                $response,
+                'has_invoices',
+                "Zakázku nelze smazat — má {$count} navázaných faktur. Místo toho ji archivuj.",
+                409,
+            );
+        }
+
+        $this->db->pdo()->prepare('DELETE FROM projects WHERE id = ?')->execute([$id]);
+
+        $user = (array) $request->getAttribute(AuthMiddleware::ATTR_USER, []);
+        $ip = $this->ipMatcher->clientIpFromRequest($request->getServerParams());
+        $this->logger->log('project.deleted', $user['id'] ?? null, 'project', $id, null, $ip, $request->getHeaderLine('User-Agent'));
+
+        return Json::ok($response, ['deleted' => true]);
+    }
+}

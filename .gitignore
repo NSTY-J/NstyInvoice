@@ -1,0 +1,27 @@
+.vscode/
+.claude/
+aspnet_client/
+log/
+cfg.php
+cfg.local.php
+cfg.docker.php
+.env
+private/
+storage/
+api/vendor/
+api/.phpunit.cache/
+web/node_modules/
+web/dist/
+manual/generated/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.bak
+*.orig
+
+# IDE
+.idea/
+

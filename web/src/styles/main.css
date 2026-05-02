@@ -1,0 +1,76 @@
+@import "tailwindcss";
+
+@theme {
+  /* ─── Primary — indigo (sladěno s MyWebdesign.cz brand #3B2D83) ─── */
+  --color-primary-50:  #F4F2FB;
+  --color-primary-100: #E5E0F4;
+  --color-primary-200: #C9C0E9;
+  --color-primary-300: #A99CD8;
+  --color-primary-400: #8675C5;
+  --color-primary-500: #6753AE;   /* lehce světlejší — main interactive, logo */
+  --color-primary-600: #5C45A0;   /* primary button */
+  --color-primary-700: #3B2D83;   /* BRAND (deep) — accents, faktura hlavička */
+  --color-primary-800: #2E2367;
+  --color-primary-900: #211A4B;
+
+  /* ─── Neutral (teplá šedá s nádechem indigo) ─── */
+  --color-neutral-50:  #FBFAFD;   /* page background */
+  --color-neutral-100: #F4F2F8;   /* subtle tint */
+  --color-neutral-200: #E7E3EE;   /* borders */
+  --color-neutral-300: #D2CCDF;
+  --color-neutral-400: #A7A0BA;
+  --color-neutral-500: #7A748C;
+  --color-neutral-600: #5A5470;
+  --color-neutral-700: #403B52;
+  --color-neutral-800: #2A2638;
+  --color-neutral-900: #15131D;   /* text */
+
+  /* ─── Accent — pastel sky blue ─── */
+  --color-accent-50:   #EFF6FC;
+  --color-accent-100:  #D7E8F6;
+  --color-accent-500:  #5BA8E0;
+  --color-accent-600:  #3F89C5;
+
+  /* ─── Semantic (pastel) ─── */
+  --color-success-50:  #ECF6F0;
+  --color-success-500: #4CAF7A;   /* soft sage */
+  --color-success-600: #3B9665;
+  --color-warning-50:  #FDF6E9;
+  --color-warning-500: #E8A547;   /* soft amber */
+  --color-warning-600: #C68A30;
+  --color-danger-50:   #FBEDED;
+  --color-danger-500:  #D45B5B;   /* soft coral */
+  --color-danger-600:  #B84545;
+
+  /* ─── Status badges (faktury) ─── */
+  --color-status-draft-bg:     #F4F2F8;
+  --color-status-draft-fg:     #5A5470;
+  --color-status-issued-bg:    #E5E0F4;
+  --color-status-issued-fg:    #3B2D83;
+  --color-status-sent-bg:      #D7E8F6;
+  --color-status-sent-fg:      #1F5E97;
+  --color-status-paid-bg:      #ECF6F0;
+  --color-status-paid-fg:      #2E7B53;
+  --color-status-overdue-bg:   #FBEDED;
+  --color-status-overdue-fg:   #B84545;
+  --color-status-cancelled-bg: #F4F2F8;
+  --color-status-cancelled-fg: #A7A0BA;
+
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SF Mono", Consolas, monospace;
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+}
+
+html, body {
+  background: var(--color-neutral-50);
+  color: var(--color-neutral-900);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#app { min-height: 100vh; }

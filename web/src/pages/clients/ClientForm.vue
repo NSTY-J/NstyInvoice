@@ -1,0 +1,291 @@
+<script setup lang="ts">
+import { ref, computed, onMounted } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { useI18n } from 'vue-i18n'
+import { clientsApi, type ClientPayload, type Client } from '@/api/clients'
+import { codebooksApi, type Country, type Currency } from '@/api/codebooks'
+
+const { t, locale } = useI18n()
+
+const route = useRoute()
+const router = useRouter()
+
+const isEdit = computed(() => route.params.id !== undefined && route.params.id !== 'new')
+const clientId = computed(() => (isEdit.value ? Number(route.params.id) : null))
+
+const form = ref<ClientPayload>({
+  company_name: '',
+  ic: null,
+  dic: null,
+  street: '',
+  city: '',
+  zip: '',
+  country_iso2: 'CZ',
+  main_email: '',
+  phone: null,
+  language: 'cs',
+  currency_default_id: 0,
+  reverse_charge: false,
+  payment_due_default: 7,
+  note: null,
+})
+
+const countries = ref<Country[]>([])
+const currencies = ref<Currency[]>([])
+const submitting = ref(false)
+const error = ref('')
+const errors = ref<Record<string, string[]>>({})
+const aresLoading = ref(false)
+const viesLoading = ref(false)
+const viesResult = ref<import('@/api/clients').ViesLookupResult | null>(null)
+
+onMounted(async () => {
+  const [c, cur] = await Promise.all([codebooksApi.countries(), codebooksApi.currencies()])
+  countries.value = c
+  currencies.value = cur
+  if (form.value.currency_default_id === 0) {
+    const def = cur.find(x => x.is_default && x.code === 'CZK') || cur[0]
+    if (def) form.value.currency_default_id = def.id
+  }
+  if (isEdit.value && clientId.value) {
+    const c = await clientsApi.get(clientId.value)
+    Object.assign(form.value, sanitize(c))
+  }
+})
+
+function sanitize(c: Client): Partial<ClientPayload> {
+  return {
+    company_name: c.company_name,
+    first_name: c.first_name ?? null,
+    last_name: c.last_name ?? null,
+    ic: c.ic ?? null,
+    dic: c.dic ?? null,
+    street: c.street,
+    city: c.city,
+    zip: c.zip,
+    country_iso2: c.country_iso2,
+    main_email: c.main_email,
+    phone: c.phone ?? null,
+    language: c.language,
+    currency_default_id: c.currency_default_id,
+    reverse_charge: c.reverse_charge,
+    payment_due_default: c.payment_due_default ?? null,
+    note: c.note ?? null,
+  }
+}
+
+async function loadFromAres() {
+  if (!form.value.ic) return
+  aresLoading.value = true
+  error.value = ''
+  try {
+    const result = await clientsApi.lookupAres(form.value.ic)
+    if (!result.found || !result.data) {
+      error.value = 'IČ nenalezeno v ARES'
+      return
+    }
+    const d = result.data
+    form.value.company_name = d.company_name
+    form.value.dic = d.dic || null
+    form.value.street = d.street
+    form.value.city = d.city
+    form.value.zip = d.zip
+    form.value.country_iso2 = d.country_iso2 || 'CZ'
+  } catch (e: any) {
+    error.value = e?.response?.data?.error?.message || 'ARES lookup selhal'
+  } finally {
+    aresLoading.value = false
+  }
+}
+
+async function checkVies() {
+  if (!form.value.dic) return
+  viesLoading.value = true
+  viesResult.value = null
+  try {
+    const result = await clientsApi.lookupVies(form.value.dic)
+    viesResult.value = result
+    // Pokud ARES nevrátil adresu (zahraniční klient), vyplníme z VIES parsed
+    if (result.valid && result.parsed && !form.value.street) {
+      form.value.street = result.parsed.street
+      form.value.city = result.parsed.city
+      form.value.zip = result.parsed.zip
+      if (result.country) form.value.country_iso2 = result.country
+      if (result.name && !form.value.company_name) {
+        form.value.company_name = result.name
+      }
+    }
+  } catch (e: any) {
+    error.value = e?.response?.data?.error?.message || 'VIES lookup selhal'
+  } finally {
+    viesLoading.value = false
+  }
+}
+
+async function submit() {
+  submitting.value = true
+  error.value = ''
+  errors.value = {}
+  try {
+    if (isEdit.value && clientId.value) {
+      await clientsApi.update(clientId.value, form.value)
+    } else {
+      const created = await clientsApi.create(form.value)
+      router.push(`/clients/${created.id}`)
+      return
+    }
+    router.push(`/clients/${clientId.value}`)
+  } catch (e: any) {
+    const data = e?.response?.data?.error
+    error.value = data?.message || t('errors.generic')
+    if (data?.fields) errors.value = data.fields
+  } finally {
+    submitting.value = false
+  }
+}
+</script>
+
+<template>
+  <div class="max-w-3xl">
+    <div class="flex items-center justify-between mb-4">
+      <h1 class="text-2xl font-semibold">
+        {{ isEdit ? t('client.edit_title') : t('client.new_title') }}
+      </h1>
+      <RouterLink to="/clients" class="text-sm text-neutral-600 hover:text-neutral-900">{{ t('client.back_to_list') }}</RouterLink>
+    </div>
+
+    <form @submit.prevent="submit" class="bg-white border border-neutral-200 rounded-lg shadow-sm">
+      <div class="p-5 space-y-4">
+        <!-- Lookup helpers -->
+        <div class="bg-primary-50 border border-primary-200 rounded-md p-3">
+          <div class="text-xs font-semibold text-primary-800 mb-2">{{ locale === 'cs' ? 'Načtení z registrů' : 'Lookup in registries' }}</div>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label class="block text-xs font-medium text-neutral-600 mb-1">{{ t('client.ic') }}</label>
+              <div class="flex gap-2">
+                <input v-model="form.ic" maxlength="8" placeholder="12345678"
+                  class="flex-1 h-9 px-3 border border-neutral-300 rounded-md font-mono text-sm focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500 outline-none" />
+                <button type="button" @click="loadFromAres" :disabled="!form.ic || aresLoading"
+                  class="px-3 h-9 text-sm bg-white border border-primary-300 text-primary-700 rounded-md hover:bg-primary-100 disabled:opacity-50">
+                  {{ aresLoading ? '…' : 'ARES' }}
+                </button>
+              </div>
+            </div>
+            <div>
+              <label class="block text-xs font-medium text-neutral-600 mb-1">{{ t('client.dic') }}</label>
+              <div class="flex gap-2">
+                <input v-model="form.dic" placeholder="CZ12345678"
+                  class="flex-1 h-9 px-3 border border-neutral-300 rounded-md font-mono text-sm focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500 outline-none" />
+                <button type="button" @click="checkVies" :disabled="!form.dic || viesLoading"
+                  class="px-3 h-9 text-sm bg-white border border-primary-300 text-primary-700 rounded-md hover:bg-primary-100 disabled:opacity-50">
+                  {{ viesLoading ? '…' : 'VIES' }}
+                </button>
+              </div>
+            </div>
+          </div>
+          <div v-if="viesResult" class="mt-2 text-xs">
+            <span v-if="viesResult.valid" class="text-primary-700">✓ {{ t('client.dic') }} {{ locale === 'cs' ? 'je platné' : 'is valid' }} — {{ viesResult.name }}</span>
+            <span v-else class="text-danger-500">✗ {{ t('client.dic') }} {{ locale === 'cs' ? 'není platné nebo neexistuje' : 'is invalid or does not exist' }}</span>
+          </div>
+        </div>
+
+        <!-- Základní -->
+        <div>
+          <label class="block text-sm font-medium text-neutral-700 mb-1">{{ t('client.company_name') }} *</label>
+          <input v-model="form.company_name" required
+            class="w-full h-10 px-3 border border-neutral-300 rounded-md focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500 outline-none" />
+          <p v-if="errors.company_name" class="text-xs text-danger-500 mt-1">{{ errors.company_name[0] }}</p>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label class="block text-sm font-medium text-neutral-700 mb-1">{{ t('client.main_email') }} *</label>
+            <input v-model="form.main_email" type="email" required
+              class="w-full h-10 px-3 border border-neutral-300 rounded-md focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500 outline-none" />
+            <p v-if="errors.main_email" class="text-xs text-danger-500 mt-1">{{ errors.main_email[0] }}</p>
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-neutral-700 mb-1">{{ t('client.phone') }}</label>
+            <input v-model="form.phone"
+              class="w-full h-10 px-3 border border-neutral-300 rounded-md focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500 outline-none" />
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div class="sm:col-span-2">
+            <label class="block text-sm font-medium text-neutral-700 mb-1">{{ t('client.street') }} *</label>
+            <input v-model="form.street" required
+              class="w-full h-10 px-3 border border-neutral-300 rounded-md focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500 outline-none" />
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-neutral-700 mb-1">{{ t('client.zip') }} *</label>
+            <input v-model="form.zip" required
+              class="w-full h-10 px-3 border border-neutral-300 rounded-md focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500 outline-none" />
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label class="block text-sm font-medium text-neutral-700 mb-1">{{ t('client.city') }} *</label>
+            <input v-model="form.city" required
+              class="w-full h-10 px-3 border border-neutral-300 rounded-md focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500 outline-none" />
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-neutral-700 mb-1">{{ t('client.country') }}</label>
+            <select v-model="form.country_iso2"
+              class="w-full h-10 px-3 border border-neutral-300 rounded-md bg-white focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500 outline-none">
+              <option v-for="c in countries" :key="c.iso2" :value="c.iso2">{{ locale === 'en' ? c.name_en : c.name_cs }}</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <div>
+            <label class="block text-sm font-medium text-neutral-700 mb-1">{{ t('client.language') }}</label>
+            <select v-model="form.language"
+              class="w-full h-10 px-3 border border-neutral-300 rounded-md bg-white focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500 outline-none">
+              <option value="cs">Čeština</option>
+              <option value="en">English</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-neutral-700 mb-1">{{ t('client.currency_default') }}</label>
+            <select v-model.number="form.currency_default_id"
+              class="w-full h-10 px-3 border border-neutral-300 rounded-md bg-white focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500 outline-none">
+              <option v-for="c in currencies" :key="c.id" :value="c.id">{{ c.label }}</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-neutral-700 mb-1">{{ t('client.payment_due_default') }}</label>
+            <input v-model.number="form.payment_due_default" type="number" min="1" max="365" placeholder="default"
+              class="w-full h-10 px-3 border border-neutral-300 rounded-md focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500 outline-none" />
+          </div>
+          <div class="flex items-end">
+            <label class="flex items-center gap-2 text-sm h-10">
+              <input v-model="form.reverse_charge" type="checkbox" class="rounded border-neutral-300 text-primary-600" />
+              <span>{{ t('client.reverse_charge') }}</span>
+            </label>
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-sm font-medium text-neutral-700 mb-1">{{ t('client.note') }}</label>
+          <textarea v-model="form.note" rows="2"
+            class="w-full px-3 py-2 border border-neutral-300 rounded-md focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500 outline-none"></textarea>
+        </div>
+
+        <div v-if="error" class="rounded-md bg-danger-50 border border-danger-500/40 px-3 py-2 text-sm text-danger-500">
+          {{ error }}
+        </div>
+      </div>
+
+      <div class="px-5 py-3 border-t border-neutral-200 bg-neutral-50 flex justify-end gap-3 rounded-b-lg">
+        <RouterLink to="/clients" class="px-4 h-10 leading-10 border border-neutral-300 rounded-md text-neutral-700 hover:bg-white text-sm font-medium">{{ t('common.cancel') }}</RouterLink>
+        <button type="submit" :disabled="submitting"
+          class="px-5 h-10 bg-primary-600 hover:bg-primary-700 disabled:bg-neutral-300 text-white text-sm font-medium rounded-md">
+          {{ submitting ? t('common.saving') : (isEdit ? t('common.save') : t('common.create')) }}
+        </button>
+      </div>
+    </form>
+  </div>
+</template>

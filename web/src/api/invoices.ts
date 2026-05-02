@@ -1,0 +1,333 @@
+import { api } from './client'
+
+export type InvoiceType = 'invoice' | 'proforma' | 'credit_note' | 'cancellation'
+export type InvoiceStatus = 'draft' | 'issued' | 'sent' | 'reminded' | 'paid' | 'cancelled'
+
+export interface InvoiceItem {
+  id?: number
+  invoice_id?: number
+  description: string
+  quantity: number
+  unit: string
+  unit_price_without_vat: number
+  vat_rate_id: number
+  vat_rate_snapshot?: number
+  total_without_vat?: number
+  total_vat?: number
+  total_with_vat?: number
+  order_index: number
+  linked_work_report_id?: number | null
+  vat_code?: string
+  vat_label_cs?: string
+  vat_label_en?: string
+}
+
+export interface VatBreakdownRow {
+  rate: number
+  base: number
+  vat: number
+}
+
+export interface InvoiceTotals {
+  without_vat: number
+  vat: number
+  with_vat: number
+  rounding?: number
+  advance_paid_amount?: number
+  amount_to_pay?: number
+}
+
+export interface Invoice {
+  id: number
+  varsymbol: string | null
+  invoice_type: InvoiceType
+  parent_invoice_id: number | null
+  client_id: number
+  project_id: number | null
+  issue_date: string
+  tax_date: string | null
+  due_date: string
+  currency_id: number
+  currency: string
+  reverse_charge: boolean
+  language: 'cs' | 'en'
+  note_above_items: string | null
+  note_below_items: string | null
+  advance_paid_amount: number
+  amount_to_pay: number
+  total_without_vat: number
+  total_vat: number
+  total_with_vat: number
+  rounding: number
+  status: InvoiceStatus
+  sent_at: string | null
+  last_reminder_at: string | null
+  reminder_count: number
+  paid_at: string | null
+  cancelled_at: string | null
+  pdf_path: string | null
+  created_at: string
+  updated_at: string
+  client_company_name?: string
+  client_main_email?: string
+  client_ic?: string | null
+  client_dic?: string | null
+  client_language?: 'cs' | 'en'
+  client_currency_default?: string
+  client_currency_default_id?: number
+  client_reverse_charge?: boolean
+  project_name?: string | null
+  project_hourly_rate?: number | null
+  project_payment_due_days?: number | null
+  currency_symbol?: string
+  currency_decimals?: number
+  bank_account_number?: string | null
+  bank_code?: string | null
+  bank_name?: string | null
+  bank_iban?: string | null
+  bank_bic?: string | null
+  project_billing_emails?: Array<{ email: string; label: string | null }>
+  items: InvoiceItem[]
+  vat_breakdown: VatBreakdownRow[]
+  totals: InvoiceTotals
+}
+
+export interface InvoiceListItem {
+  id: number
+  varsymbol: string | null
+  invoice_type: InvoiceType
+  parent_invoice_id: number | null
+  client_id: number
+  project_id: number | null
+  issue_date: string
+  tax_date: string | null
+  due_date: string
+  currency_id?: number
+  currency: string
+  total_without_vat: number
+  total_vat: number
+  total_with_vat: number
+  advance_paid_amount: number
+  amount_to_pay: number
+  status: InvoiceStatus
+  sent_at: string | null
+  last_reminder_at: string | null
+  reminder_count: number
+  paid_at: string | null
+  cancelled_at: string | null
+  client_company_name: string
+  project_name: string | null
+  month_bucket: string
+}
+
+export interface MonthGroup {
+  month: string
+  count: number
+  totals_per_currency: Array<{
+    currency: string
+    without_vat: number
+    vat: number
+    with_vat: number
+  }>
+  invoices: InvoiceListItem[]
+}
+
+export interface InvoicePayload {
+  invoice_type?: InvoiceType
+  client_id: number
+  project_id?: number | null
+  issue_date?: string
+  tax_date?: string | null
+  due_date?: string
+  currency_id?: number
+  reverse_charge?: boolean
+  language?: 'cs' | 'en'
+  note_above_items?: string | null
+  note_below_items?: string | null
+  advance_paid_amount?: number
+  items: Array<{
+    description: string
+    quantity: number
+    unit: string
+    unit_price_without_vat: number
+    vat_rate_id: number
+    order_index: number
+  }>
+}
+
+export interface ListFilters {
+  status?: string | string[]
+  type?: string | string[]
+  client_id?: number
+  project_id?: number
+  year?: number
+  month?: number
+  date_from?: string
+  date_to?: string
+  unpaid_only?: boolean
+  overdue?: boolean
+  q?: string
+  page?: number
+  per_page?: number
+}
+
+export interface InvoiceListMeta {
+  total: number
+  page?: number
+  per_page?: number
+  pages?: number
+}
+
+export const invoicesApi = {
+  listGrouped: (filters: ListFilters = {}) => {
+    const params: Record<string, string | number> = {}
+    if (filters.q) params.q = filters.q
+    if (filters.status) {
+      params['filter[status]'] = Array.isArray(filters.status) ? filters.status.join(',') : filters.status
+    }
+    if (filters.type) {
+      params['filter[type]'] = Array.isArray(filters.type) ? filters.type.join(',') : filters.type
+    }
+    if (filters.client_id)   params['filter[client_id]']   = filters.client_id
+    if (filters.project_id)  params['filter[project_id]']  = filters.project_id
+    if (filters.year)        params['filter[year]']        = filters.year
+    if (filters.month)       params['filter[month]']       = filters.month
+    if (filters.date_from)   params['filter[date_from]']   = filters.date_from
+    if (filters.date_to)     params['filter[date_to]']     = filters.date_to
+    if (filters.unpaid_only) params['filter[unpaid_only]'] = 1
+    if (filters.overdue)     params['filter[overdue]']     = 1
+    if (filters.page)        params.page                   = filters.page
+    if (filters.per_page)    params.per_page               = filters.per_page
+    return api.get<{ data: MonthGroup[]; meta: InvoiceListMeta }>('/invoices', { params }).then(r => r.data)
+  },
+
+  exportCsv: (filters: ListFilters = {}) => {
+    const params = new URLSearchParams()
+    if (filters.q) params.set('q', filters.q)
+    if (filters.status)     params.set('filter[status]',  Array.isArray(filters.status) ? filters.status.join(',') : filters.status)
+    if (filters.type)       params.set('filter[type]',    Array.isArray(filters.type) ? filters.type.join(',') : filters.type)
+    if (filters.client_id)  params.set('filter[client_id]',  String(filters.client_id))
+    if (filters.year)       params.set('filter[year]',       String(filters.year))
+    if (filters.date_from)  params.set('filter[date_from]',  filters.date_from)
+    if (filters.date_to)    params.set('filter[date_to]',    filters.date_to)
+    return api.get<Blob>('/invoices/export.csv', { params, responseType: 'blob' })
+  },
+
+  get:    (id: number) => api.get<Invoice>(`/invoices/${id}`).then(r => r.data),
+  create: (payload: InvoicePayload) => api.post<Invoice>('/invoices', payload).then(r => r.data),
+  update: (id: number, payload: InvoicePayload, force = false) =>
+    api.put<Invoice>(`/invoices/${id}${force ? '?force=1' : ''}`, payload).then(r => r.data),
+  delete: (id: number) => api.delete(`/invoices/${id}`),
+
+  // Akce nad fakturou
+  issue:    (id: number) => api.post<Invoice>(`/invoices/${id}/issue`).then(r => r.data),
+  markPaid: (id: number, paidAt?: string) =>
+    api.post<Invoice>(`/invoices/${id}/mark-paid`, { paid_at: paidAt || new Date().toISOString().slice(0, 10) }).then(r => r.data),
+  cancel: (id: number, mode: 'internal' | 'credit_note', reason: string = '') =>
+    api.post<{ cancellation_id?: number; credit_note_id?: number; edit_url?: string; invoice?: Invoice }>(
+      `/invoices/${id}/cancel`,
+      { mode, reason },
+    ).then(r => r.data),
+  issueFinal: (proformaId: number, opts?: { tax_date?: string; due_date?: string; advance_paid_amount?: number | null }) =>
+    api.post<{ final_invoice_id: number; edit_url: string; invoice: Invoice }>(
+      `/invoices/${proformaId}/issue-final`,
+      opts || {},
+    ).then(r => r.data),
+  clone: (id: number, opts?: { increment_month_in_descriptions?: boolean; issue_date?: string }) =>
+    api.post<{ draft_id: number }>(`/invoices/${id}/clone`, opts || {}).then(r => r.data),
+  bulkReissue: (invoiceIds: number[], opts?: { increment_month_in_descriptions?: boolean; issue_date?: string }) =>
+    api.post<{ created: Array<{ source_id: number; draft_id: number }>; errors: Array<{ source_id: number; error: string }> }>(
+      '/invoices/bulk-reissue',
+      { invoice_ids: invoiceIds, ...opts },
+    ).then(r => r.data),
+
+  pdfUrl: (id: number, download: boolean = false) => {
+    // Přímá navigace v prohlížeči neposílá X-Supplier-Id header (na rozdíl od axios) —
+    // proto přidáváme supplier_id jako query param. Middleware ho přečte jako fallback.
+    const sid = localStorage.getItem('myinvoice.current_supplier_id')
+    const params = new URLSearchParams()
+    if (download) params.set('download', '1')
+    if (sid && /^\d+$/.test(sid)) params.set('supplier_id', sid)
+    const qs = params.toString()
+    return `/api/invoices/${id}/pdf${qs ? '?' + qs : ''}`
+  },
+
+  send: (id: number, payload?: { to?: string[]; cc?: string[]; bcc?: string[]; subject_override?: string | null }) =>
+    api.post<{ sent_to: string[]; cc: string[]; bcc: string[]; sent_at: string; is_test: false }>(
+      `/invoices/${id}/send`,
+      payload || {},
+    ).then(r => r.data),
+
+  sendReminder: (id: number) =>
+    api.post<{ invoice: Invoice; sent_to: string[]; days_overdue: number; sent_at: string }>(
+      `/invoices/${id}/reminder`,
+    ).then(r => r.data),
+
+  bulkSendReminders: (invoiceIds: number[]) =>
+    api.post<{
+      sent: Array<{ invoice_id: number; sent_to: string[]; days_overdue: number }>;
+      errors: Array<{ invoice_id: number; error: string }>;
+    }>('/invoices/bulk-reminder', { invoice_ids: invoiceIds }).then(r => r.data),
+
+  activity: (id: number) =>
+    api.get<Array<{
+      id: number; user_id: number | null; user_email: string | null; user_name: string | null;
+      action: string; payload: Record<string, unknown> | null; ip: string | null; created_at: string;
+    }>>(`/invoices/${id}/activity`).then(r => r.data),
+
+  sendTest: (id: number) =>
+    api.post<{ sent_to: string[]; sent_at: string; is_test: true }>(
+      `/invoices/${id}/send-test`,
+      {},
+    ).then(r => r.data),
+
+  sendTestReminder: (id: number) =>
+    api.post<{ sent_to: string[]; sent_at: string; days_overdue: number; is_test: true }>(
+      `/invoices/${id}/reminder-test`,
+      {},
+    ).then(r => r.data),
+
+  // Work report (výkaz víceprací)
+  getWorkReport: (invoiceId: number) =>
+    api.get<WorkReport | null>(`/invoices/${invoiceId}/work-report`).then(r => r.data),
+  saveWorkReport: (invoiceId: number, payload: WorkReportPayload, force = false) =>
+    api.put<WorkReport>(`/invoices/${invoiceId}/work-report`, payload, {
+      params: force ? { force: 1 } : undefined,
+    }).then(r => r.data),
+  deleteWorkReport: (invoiceId: number, force = false) =>
+    api.delete<{ deleted: true }>(`/invoices/${invoiceId}/work-report`, {
+      params: force ? { force: 1 } : undefined,
+    }).then(r => r.data),
+}
+
+export interface WorkReportItem {
+  id?: number
+  description: string
+  work_date?: string | null
+  hours: number
+  rate: number
+  total_amount?: number
+  order_index: number
+}
+
+export interface WorkReport {
+  id: number
+  invoice_id: number
+  project_id: number
+  title: string
+  total_hours: number
+  total_amount: number
+  items: WorkReportItem[]
+}
+
+export interface WorkReportPayload {
+  project_id: number
+  title: string
+  items: Array<{
+    description: string
+    work_date?: string | null
+    hours: number
+    rate: number
+    order_index: number
+  }>
+}

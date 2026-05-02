@@ -1,0 +1,77 @@
+<?php
+
+declare(strict_types=1);
+
+namespace MyInvoice\Service\Validation;
+
+final class InvoiceValidation
+{
+    /**
+     * @return array<string, string[]>
+     */
+    public static function invoice(array $data): array
+    {
+        $err = [];
+
+        $type = (string) ($data['invoice_type'] ?? 'invoice');
+        if (!in_array($type, ['invoice', 'proforma', 'credit_note', 'cancellation'], true)) {
+            $err['invoice_type'][] = 'Neplatný typ dokladu';
+        }
+
+        if (empty($data['client_id']) || !is_numeric($data['client_id'])) {
+            $err['client_id'][] = 'Klient je povinný';
+        }
+
+        if (isset($data['currency_id']) && (int) $data['currency_id'] <= 0) {
+            $err['currency_id'][] = 'Neplatné currency_id';
+        }
+
+        if (!empty($data['issue_date']) && !self::isValidDate((string) $data['issue_date'])) {
+            $err['issue_date'][] = 'Neplatné datum vystavení';
+        }
+        if (!empty($data['due_date']) && !self::isValidDate((string) $data['due_date'])) {
+            $err['due_date'][] = 'Neplatné datum splatnosti';
+        }
+        if ($type !== 'proforma' && !empty($data['tax_date']) && !self::isValidDate((string) $data['tax_date'])) {
+            $err['tax_date'][] = 'Neplatné DUZP';
+        }
+
+        $items = $data['items'] ?? [];
+        if (!is_array($items)) {
+            $err['items'][] = 'items musí být pole';
+        } else {
+            foreach (array_values($items) as $i => $item) {
+                if (!is_array($item)) {
+                    $err["items.{$i}"][] = 'Neplatná položka';
+                    continue;
+                }
+                if (empty($item['description']) || trim((string) $item['description']) === '') {
+                    $err["items.{$i}.description"][] = 'Popis je povinný';
+                }
+                $qty = (float) ($item['quantity'] ?? 0);
+                if ($qty <= 0) {
+                    $err["items.{$i}.quantity"][] = 'Množství musí být kladné';
+                }
+                if (!isset($item['vat_rate_id']) || !is_numeric($item['vat_rate_id'])) {
+                    $err["items.{$i}.vat_rate_id"][] = 'DPH sazba je povinná';
+                }
+                if (!isset($item['unit_price_without_vat']) || !is_numeric($item['unit_price_without_vat'])) {
+                    $err["items.{$i}.unit_price_without_vat"][] = 'Jednotková cena je povinná';
+                }
+            }
+        }
+
+        $advance = (float) ($data['advance_paid_amount'] ?? 0);
+        if ($advance < 0) {
+            $err['advance_paid_amount'][] = 'Záloha nesmí být záporná';
+        }
+
+        return $err;
+    }
+
+    private static function isValidDate(string $date): bool
+    {
+        $d = \DateTimeImmutable::createFromFormat('Y-m-d', $date);
+        return $d !== false && $d->format('Y-m-d') === $date;
+    }
+}

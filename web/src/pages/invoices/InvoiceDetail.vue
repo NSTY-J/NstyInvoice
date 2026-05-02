@@ -1,0 +1,704 @@
+<script setup lang="ts">
+import { ref, computed, onMounted } from 'vue'
+import { useRoute, useRouter, RouterLink } from 'vue-router'
+import { useI18n } from 'vue-i18n'
+import { invoicesApi, type Invoice, type WorkReport } from '@/api/invoices'
+import { formatMoney, formatDate, formatPercent, statusLabel, typeLabel, statusBadgeClass } from '@/composables/useFormat'
+import { useAuthStore } from '@/stores/auth'
+import { useHotkey } from '@/composables/useHotkey'
+
+const { t } = useI18n()
+
+const auth = useAuthStore()
+const isAdmin = computed(() => auth.user?.role === 'admin')
+
+const route = useRoute()
+const router = useRouter()
+
+const invoice = ref<Invoice | null>(null)
+const loading = ref(true)
+const busy = ref<string | null>(null)
+const flash = ref<{ type: 'success' | 'error'; text: string } | null>(null)
+
+// Cancel modal state
+const cancelOpen = ref(false)
+const cancelMode = ref<'internal' | 'credit_note'>('credit_note')
+const cancelReason = ref('')
+
+// Send modal state
+const sendOpen = ref(false)
+const sendTo = ref('')
+
+// Reminder modal state
+const reminderOpen = ref(false)
+
+const activity = ref<Array<{ id: number; user_email: string | null; user_name: string | null; action: string; payload: any; ip: string | null; created_at: string }>>([])
+const workReport = ref<WorkReport | null>(null)
+const wrHasDates = computed(() => !!workReport.value?.items.some(i => !!i.work_date))
+
+async function load() {
+  loading.value = true
+  invoice.value = await invoicesApi.get(Number(route.params.id))
+  loading.value = false
+  // Activity log + work report (parallel, ne blokuje UI)
+  invoicesApi.activity(Number(route.params.id))
+    .then(a => { activity.value = a })
+    .catch(() => {})
+  invoicesApi.getWorkReport(Number(route.params.id))
+    .then(wr => { workReport.value = wr })
+    .catch(() => {})
+}
+
+onMounted(load)
+
+function actionLabel(a: string): string {
+  const map: Record<string, string> = {
+    'invoice.created': 'invoice.actions.created',
+    'invoice.updated': 'invoice.actions.updated',
+    'invoice.force_updated': 'invoice.actions.force_updated',
+    'invoice.issued': 'invoice.actions.issued',
+    'invoice.paid': 'invoice.actions.paid',
+    'invoice.cancelled': 'invoice.actions.cancelled',
+    'invoice.cloned': 'invoice.actions.cloned',
+    'invoice.credit_note_created': 'invoice.actions.credit_note_created',
+    'invoice.reminder_sent': 'invoice.actions.reminder_sent',
+    'email.sent': 'invoice.actions.email_sent',
+    'email.sent_test': 'invoice.actions.email_sent_test',
+    'email.sent_test_reminder': 'invoice.actions.email_sent_test_reminder',
+    'pdf.generated': 'invoice.actions.pdf_generated',
+  }
+  return map[a] ? (t(map[a]) as string) : a
+}
+
+function actionColor(a: string): string {
+  if (a.includes('reminder')) return 'bg-warning-50 text-warning-600'
+  if (a.includes('issued') || a.includes('paid') || a.includes('sent')) return 'bg-success-50 text-success-600'
+  if (a.includes('cancelled') || a.includes('force')) return 'bg-warning-50 text-warning-600'
+  if (a.includes('credit_note') || a.includes('cloned')) return 'bg-primary-100 text-primary-700'
+  return 'bg-neutral-100 text-neutral-600'
+}
+
+function showFlash(type: 'success' | 'error', text: string) {
+  flash.value = { type, text }
+  setTimeout(() => { flash.value = null }, 6000)
+}
+
+async function deleteInvoice() {
+  if (!invoice.value || invoice.value.status !== 'draft') return
+  if (!confirm(t('invoice.delete_draft_confirm'))) return
+  busy.value = 'delete'
+  try {
+    await invoicesApi.delete(invoice.value.id)
+    router.push('/invoices')
+  } catch (e: any) {
+    showFlash('error', e?.response?.data?.error?.message || t('invoice.delete_failed'))
+  } finally {
+    busy.value = null
+  }
+}
+
+async function issue() {
+  if (!invoice.value || invoice.value.status !== 'draft') return
+  if (invoice.value.items.length === 0) {
+    showFlash('error', t('invoice.issue_no_items'))
+    return
+  }
+  if (!confirm(t('invoice.issue_confirm'))) return
+  busy.value = 'issue'
+  try {
+    invoice.value = await invoicesApi.issue(invoice.value.id)
+    showFlash('success', t('invoice.issued_as', { varsymbol: invoice.value.varsymbol }))
+  } catch (e: any) {
+    showFlash('error', e?.response?.data?.error?.message || t('invoice.issue_failed'))
+  } finally {
+    busy.value = null
+  }
+}
+
+const paidAtInput = ref<string>(new Date().toISOString().slice(0, 10))
+const markPaidOpen = ref(false)
+
+useHotkey('escape', () => {
+  if (markPaidOpen.value)     markPaidOpen.value = false
+  else if (cancelOpen.value)  cancelOpen.value = false
+  else if (sendOpen.value)    sendOpen.value = false
+  else if (reminderOpen.value) reminderOpen.value = false
+})
+
+async function markPaid() {
+  if (!invoice.value) return
+  busy.value = 'paid'
+  try {
+    invoice.value = await invoicesApi.markPaid(invoice.value.id, paidAtInput.value)
+    markPaidOpen.value = false
+    showFlash('success', t('invoice.marked_paid_at', { date: paidAtInput.value }))
+  } catch (e: any) {
+    showFlash('error', e?.response?.data?.error?.message || t('invoice.operation_failed'))
+  } finally {
+    busy.value = null
+  }
+}
+
+async function cancel() {
+  if (!invoice.value) return
+  busy.value = 'cancel'
+  try {
+    const result = await invoicesApi.cancel(invoice.value.id, cancelMode.value, cancelReason.value)
+    cancelOpen.value = false
+    cancelReason.value = ''
+    if (result.credit_note_id) {
+      router.push(`/invoices/${result.credit_note_id}/edit`)
+    } else {
+      await load()
+      showFlash('success', t('invoice.cancelled_ok'))
+    }
+  } catch (e: any) {
+    showFlash('error', e?.response?.data?.error?.message || t('invoice.cancel_failed'))
+  } finally {
+    busy.value = null
+  }
+}
+
+async function cloneInvoice() {
+  if (!invoice.value) return
+  if (!confirm(t('invoice.clone_confirm', { varsymbol: invoice.value.varsymbol || `#${invoice.value.id}` }))) return
+  const incrementMonths = confirm(t('invoice.clone_increment_confirm'))
+  busy.value = 'clone'
+  try {
+    const r = await invoicesApi.clone(invoice.value.id, { increment_month_in_descriptions: incrementMonths })
+    if (!r?.draft_id) {
+      showFlash('error', t('invoice.invalid_response'))
+      return
+    }
+    router.push(`/invoices/${r.draft_id}/edit`)
+  } catch (e: any) {
+    showFlash('error', e?.response?.data?.error?.message || t('invoice.clone_failed'))
+  } finally {
+    busy.value = null
+  }
+}
+
+function editIssued() {
+  if (!invoice.value) return
+  const ok = confirm(
+    `⚠ POZOR — úprava VYSTAVENÉ faktury\n\n` +
+    `Faktura ${invoice.value.varsymbol} už byla vystavena${invoice.value.sent_at ? ' a odeslána klientovi' : ''}.\n\n` +
+    `Úprava:\n` +
+    `• změní obsah dokladu, který klient možná už eviduje v účetnictví\n` +
+    `• přepíše JSON snapshoty (immutability je porušena)\n` +
+    `• po uložení se NEgeneruje nový varsymbol — zůstává původní\n` +
+    `• tato akce je auditována v ActivityLog\n\n` +
+    `Doporučeno: vystavit dobropis. Pokračovat na editor i tak?`
+  )
+  if (!ok) return
+  router.push(`/invoices/${invoice.value.id}/edit?force=1`)
+}
+
+function downloadPdf() {
+  if (!invoice.value) return
+  window.open(invoicesApi.pdfUrl(invoice.value.id, false), '_blank')
+}
+
+async function sendTest() {
+  if (!invoice.value) return
+  busy.value = 'send-test'
+  try {
+    const r = await invoicesApi.sendTest(invoice.value.id)
+    showFlash('success', t('invoice.send_test_done', { recipients: r.sent_to.join(', ') }))
+  } catch (e: any) {
+    showFlash('error', e?.response?.data?.error?.message || t('invoice.send_test_failed'))
+  } finally {
+    busy.value = null
+  }
+}
+
+async function sendTestReminder() {
+  if (!invoice.value) return
+  busy.value = 'send-test-reminder'
+  try {
+    const r = await invoicesApi.sendTestReminder(invoice.value.id)
+    showFlash('success', t('invoice.send_test_reminder_done', { recipients: r.sent_to.join(', '), days: r.days_overdue }))
+  } catch (e: any) {
+    showFlash('error', e?.response?.data?.error?.message || t('invoice.send_test_reminder_failed'))
+  } finally {
+    busy.value = null
+  }
+}
+
+const canSendTestReminder = computed(() => invoice.value && invoice.value.invoice_type === 'invoice')
+
+function openSendModal() {
+  if (!invoice.value) return
+  // Pre-fill recipients: client_main_email + project billing emails
+  // backend defaultně použije resolveRecipients, ale ukážeme to v poli pro úpravu
+  sendTo.value = invoice.value.client_main_email || ''
+  sendOpen.value = true
+}
+
+async function send() {
+  if (!invoice.value) return
+  const recipients = sendTo.value.split(',').map(e => e.trim()).filter(Boolean)
+  if (!recipients.length) {
+    showFlash('error', t('invoice.recipients_required'))
+    return
+  }
+  busy.value = 'send'
+  try {
+    const r = await invoicesApi.send(invoice.value.id, { to: recipients })
+    sendOpen.value = false
+    showFlash('success', t('invoice.send_done', { recipients: r.sent_to.join(', ') }))
+    await load()
+  } catch (e: any) {
+    showFlash('error', e?.response?.data?.error?.message || t('invoice.send_failed'))
+  } finally {
+    busy.value = null
+  }
+}
+
+const isDraft = computed(() => invoice.value?.status === 'draft')
+const isIssued = computed(() => invoice.value && ['issued', 'sent', 'reminded'].includes(invoice.value.status))
+const canCancel = computed(() => invoice.value && ['issued', 'sent', 'reminded', 'paid'].includes(invoice.value.status)
+  && !['credit_note', 'cancellation'].includes(invoice.value.invoice_type))
+// Cancellation = interní storno doklad, nikdy se neposílá klientovi (na rozdíl od dobropisu)
+const canSendEmail = computed(() =>
+  invoice.value
+  && ['issued', 'sent', 'reminded', 'paid'].includes(invoice.value.status)
+  && invoice.value.invoice_type !== 'cancellation'
+)
+const canSendTest = computed(() => invoice.value && invoice.value.invoice_type !== 'cancellation')
+
+// Upomínka — jen pro běžnou fakturu (ne proforma/dobropis/storno) ve stavu issued/sent/reminded a po splatnosti
+const canSendReminder = computed(() => {
+  if (!invoice.value) return false
+  if (invoice.value.invoice_type !== 'invoice') return false
+  if (!['issued', 'sent', 'reminded'].includes(invoice.value.status)) return false
+  const due = new Date(invoice.value.due_date)
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+  return due < today
+})
+
+const daysOverdue = computed(() => {
+  if (!invoice.value) return 0
+  const due = new Date(invoice.value.due_date)
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+  due.setHours(0, 0, 0, 0)
+  return Math.max(0, Math.floor((today.getTime() - due.getTime()) / 86_400_000))
+})
+
+function openReminderModal() {
+  if (!invoice.value) return
+  reminderOpen.value = true
+}
+
+async function sendReminder() {
+  if (!invoice.value) return
+  busy.value = 'reminder'
+  try {
+    const r = await invoicesApi.sendReminder(invoice.value.id)
+    invoice.value = r.invoice
+    reminderOpen.value = false
+    showFlash('success', t('invoice.reminder_sent_ok', { recipients: r.sent_to.join(', '), days: r.days_overdue }))
+    invoicesApi.activity(invoice.value.id).then(a => { activity.value = a }).catch(() => {})
+  } catch (e: any) {
+    showFlash('error', e?.response?.data?.error?.message || t('invoice.reminder_failed'))
+  } finally {
+    busy.value = null
+  }
+}
+</script>
+
+<template>
+  <div v-if="loading" class="text-center text-neutral-500 py-12">{{ t('common.loading') }}</div>
+
+  <div v-else-if="invoice" class="max-w-5xl space-y-4">
+    <RouterLink to="/invoices" class="text-sm text-neutral-600 hover:text-neutral-900">{{ t('invoice.back_to_list') }}</RouterLink>
+    <div class="flex items-start justify-between gap-4">
+      <h1 class="text-2xl font-semibold flex items-center gap-3">
+        <span v-if="invoice.varsymbol" class="font-mono">{{ invoice.varsymbol }}</span>
+        <span v-else class="text-neutral-400 font-mono">{{ t('invoice.draft_id', { id: invoice.id }) }}</span>
+        <span class="text-xs px-2 py-0.5 rounded font-normal" :class="statusBadgeClass(invoice.status)">
+          {{ statusLabel(invoice.status) }}
+        </span>
+        <span class="text-xs px-2 py-0.5 rounded font-normal bg-neutral-100 text-neutral-600">
+          {{ typeLabel(invoice.invoice_type) }}
+        </span>
+      </h1>
+      <div class="flex flex-wrap gap-2 justify-end">
+        <!-- Draft akce -->
+        <RouterLink v-if="isDraft" :to="`/invoices/${invoice.id}/edit`"
+          class="cursor-pointer px-3 h-9 text-sm border border-neutral-300 rounded-md text-neutral-700 hover:bg-neutral-50 inline-flex items-center gap-1.5">
+          <svg class="w-4 h-4 text-neutral-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M11 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-5m-1.414-9.414a2 2 0 1 1 2.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
+          Upravit
+        </RouterLink>
+        <button v-if="isDraft" @click="issue" :disabled="busy !== null"
+          class="cursor-pointer px-3 h-9 text-sm bg-primary-600 hover:bg-primary-700 disabled:bg-neutral-300 text-white font-medium rounded-md inline-flex items-center gap-1.5">
+          <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"/></svg>
+          {{ busy === 'issue' ? '…' : t('invoice.issue') }}
+        </button>
+        <button v-if="isDraft" @click="deleteInvoice" :disabled="busy !== null"
+          class="cursor-pointer px-3 h-9 text-sm border border-danger-500/50 text-danger-500 hover:bg-danger-50 rounded-md inline-flex items-center gap-1.5">
+          <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0 1 16.138 21H7.862a2 2 0 0 1-1.995-1.858L5 7m5 4v6m4-6v6M1 7h22M9 7V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v3"/></svg>
+          {{ t('common.delete') }}
+        </button>
+
+        <!-- Klonovat -->
+        <button v-if="!isDraft && !['cancellation','credit_note'].includes(invoice.invoice_type)" @click="cloneInvoice" :disabled="busy !== null"
+          class="cursor-pointer px-3 h-9 text-sm border border-primary-500/40 text-primary-700 hover:bg-primary-50 rounded-md inline-flex items-center gap-1.5">
+          <svg class="w-4 h-4 text-primary-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M8 16H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v2m-6 12h8a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2h-8a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2z"/></svg>
+          {{ busy === 'clone' ? '…' : t('invoice.clone') }}
+        </button>
+
+        <!-- PDF / náhled -->
+        <button v-if="!isDraft || invoice.items.length > 0" @click="downloadPdf"
+          class="cursor-pointer px-3 h-9 text-sm border border-primary-500/40 rounded-md text-primary-700 hover:bg-primary-50 inline-flex items-center gap-1.5">
+          <svg class="w-4 h-4 text-primary-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5.586a1 1 0 0 1 .707.293l5.414 5.414a1 1 0 0 1 .293.707V19a2 2 0 0 1-2 2z"/></svg>
+          {{ t('invoice.pdf') }}
+        </button>
+
+        <!-- Issued+ akce -->
+        <button v-if="canSendEmail" @click="openSendModal" :disabled="busy !== null"
+          class="cursor-pointer px-3 h-9 text-sm bg-primary-600 hover:bg-primary-700 disabled:bg-neutral-300 text-white font-medium rounded-md inline-flex items-center gap-1.5">
+          <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M3 8l7.89 5.26a2 2 0 0 0 2.22 0L21 8M5 19h14a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2z"/></svg>
+          {{ t('invoice.send_to_client') }}
+        </button>
+        <button v-if="canSendReminder" @click="openReminderModal" :disabled="busy !== null"
+          class="cursor-pointer px-3 h-9 text-sm bg-warning-500 hover:bg-warning-600 disabled:bg-neutral-300 text-white font-medium rounded-md inline-flex items-center gap-1.5"
+          :title="t('invoice.reminder_tooltip', { days: daysOverdue })">
+          <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01M5.07 19h13.86c1.54 0 2.5-1.67 1.73-3L13.73 4a2 2 0 0 0-3.46 0L3.34 16c-.77 1.33.19 3 1.73 3z"/></svg>
+          {{ t('invoice.send_reminder') }}
+        </button>
+        <button v-if="isIssued" @click="markPaidOpen = true" :disabled="busy !== null"
+          class="cursor-pointer px-3 h-9 text-sm border border-success-500/50 text-success-600 hover:bg-success-50 rounded-md inline-flex items-center gap-1.5">
+          <svg class="w-4 h-4 text-success-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 14l2 2 4-4m6 2a9 9 0 1 1-18 0 9 9 0 0 1 18 0z"/></svg>
+          {{ t('invoice.mark_paid') }}
+        </button>
+      </div>
+    </div>
+
+    <div class="flex items-start justify-between gap-4">
+      <div class="flex-1 min-w-0 space-y-1">
+        <div class="text-lg font-semibold text-neutral-900">
+          <RouterLink :to="`/invoices?client_id=${invoice.client_id}`"
+            class="text-primary-700 hover:text-primary-800 hover:underline"
+            :title="t('invoice.show_invoices_for_client')">
+            {{ invoice.client_company_name }}
+          </RouterLink>
+        </div>
+        <div v-if="invoice.project_name" class="text-sm text-neutral-600">
+          {{ invoice.project_name }}
+        </div>
+        <div v-if="invoice.client_main_email || invoice.project_billing_emails?.length" class="text-xs text-neutral-500 flex flex-wrap gap-x-3 gap-y-0.5">
+          <span v-if="invoice.client_main_email">✉ {{ invoice.client_main_email }}</span>
+          <span v-for="b in invoice.project_billing_emails || []" :key="b.email">
+            ✉ {{ b.email }}<span v-if="b.label" class="text-neutral-400"> ({{ b.label }})</span>
+          </span>
+        </div>
+      </div>
+      <div v-if="invoice.client_ic || invoice.client_dic" class="text-xs font-mono text-neutral-500 text-right whitespace-nowrap">
+        <span v-if="invoice.client_ic">{{ t('common.ic') }} {{ invoice.client_ic }}</span>
+        <span v-if="invoice.client_ic && invoice.client_dic">, </span>
+        <span v-if="invoice.client_dic">{{ t('common.dic') }} {{ invoice.client_dic }}</span>
+      </div>
+    </div>
+
+    <!-- Flash message -->
+    <div v-if="flash" class="rounded-md px-4 py-2 text-sm"
+      :class="flash.type === 'success' ? 'bg-success-50 border border-success-500/40 text-success-600' : 'bg-danger-50 border border-danger-500/40 text-danger-500'">
+      {{ flash.text }}
+    </div>
+
+    <!-- Mark paid modal -->
+    <div v-if="markPaidOpen" class="fixed inset-0 bg-neutral-900/40 z-50 flex items-center justify-center p-4" @click.self="markPaidOpen = false">
+      <div class="bg-white rounded-xl shadow-lg max-w-sm w-full p-5">
+        <h3 class="text-lg font-semibold mb-3">{{ t('invoice.modals.mark_paid_title') }}</h3>
+        <label class="block text-sm font-medium text-neutral-700 mb-1">{{ t('invoice.modals.mark_paid_date') }}</label>
+        <input v-model="paidAtInput" type="date" class="w-full h-10 px-3 border border-neutral-300 rounded-md mb-4" />
+        <div class="flex justify-end gap-2">
+          <button @click="markPaidOpen = false" class="cursor-pointer px-3 h-9 text-sm border border-neutral-300 rounded-md text-neutral-700 hover:bg-neutral-50">{{ t('common.cancel') }}</button>
+          <button @click="markPaid" :disabled="busy !== null"
+            class="cursor-pointer px-4 h-9 text-sm bg-success-500 hover:bg-success-600 disabled:bg-neutral-300 text-white font-medium rounded-md">
+            {{ busy === 'paid' ? '…' : t('common.confirm') }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Cancel modal -->
+    <div v-if="cancelOpen" class="fixed inset-0 bg-neutral-900/40 z-50 flex items-center justify-center p-4" @click.self="cancelOpen = false">
+      <div class="bg-white rounded-xl shadow-lg max-w-md w-full p-5">
+        <h3 class="text-lg font-semibold mb-3">{{ t('invoice.modals.cancel_title') }}</h3>
+        <p class="text-sm text-neutral-600 mb-3">{{ t('invoice.modals.cancel_choose') }}</p>
+        <div class="space-y-2 mb-4">
+          <label class="flex items-start gap-2 p-3 border rounded-md cursor-pointer"
+            :class="cancelMode === 'credit_note' ? 'border-primary-500 bg-primary-50' : 'border-neutral-200'">
+            <input type="radio" v-model="cancelMode" value="credit_note" class="mt-1" />
+            <div>
+              <div class="font-medium text-sm">{{ t('invoice.modals.cancel_credit_note') }}</div>
+              <div class="text-xs text-neutral-500">{{ t('invoice.modals.cancel_credit_desc') }}</div>
+            </div>
+          </label>
+          <label class="flex items-start gap-2 p-3 border rounded-md cursor-pointer"
+            :class="cancelMode === 'internal' ? 'border-primary-500 bg-primary-50' : 'border-neutral-200'">
+            <input type="radio" v-model="cancelMode" value="internal" class="mt-1" />
+            <div>
+              <div class="font-medium text-sm">{{ t('invoice.modals.cancel_internal') }}</div>
+              <div class="text-xs text-neutral-500">{{ t('invoice.modals.cancel_internal_desc') }}</div>
+            </div>
+          </label>
+        </div>
+        <label class="block text-sm font-medium text-neutral-700 mb-1">{{ t('invoice.modals.cancel_reason') }}</label>
+        <textarea v-model="cancelReason" rows="2" class="w-full px-3 py-2 border border-neutral-300 rounded-md text-sm mb-4"></textarea>
+        <div class="flex justify-end gap-2">
+          <button @click="cancelOpen = false" class="cursor-pointer px-3 h-9 text-sm border border-neutral-300 rounded-md text-neutral-700 hover:bg-neutral-50">{{ t('common.cancel') }}</button>
+          <button @click="cancel" :disabled="busy !== null"
+            class="cursor-pointer px-4 h-9 text-sm bg-warning-500 hover:bg-warning-600 disabled:bg-neutral-300 text-white font-medium rounded-md">
+            {{ busy === 'cancel' ? '…' : t('common.confirm') }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Send modal -->
+    <div v-if="sendOpen" class="fixed inset-0 bg-neutral-900/40 z-50 flex items-center justify-center p-4" @click.self="sendOpen = false">
+      <div class="bg-white rounded-xl shadow-lg max-w-md w-full p-5">
+        <h3 class="text-lg font-semibold mb-3">{{ t('invoice.modals.send_title') }}</h3>
+        <label class="block text-sm font-medium text-neutral-700 mb-1">{{ t('invoice.modals.send_recipients') }}</label>
+        <input v-model="sendTo" type="text" class="w-full h-10 px-3 border border-neutral-300 rounded-md mb-2 text-sm" />
+        <p class="text-xs text-neutral-500 mb-4">{{ t('invoice.modals.send_default_hint') }}</p>
+        <div class="flex justify-end gap-2">
+          <button @click="sendOpen = false" class="cursor-pointer px-3 h-9 text-sm border border-neutral-300 rounded-md text-neutral-700 hover:bg-neutral-50">{{ t('common.cancel') }}</button>
+          <button @click="send" :disabled="busy !== null"
+            class="cursor-pointer px-4 h-9 text-sm bg-primary-600 hover:bg-primary-700 disabled:bg-neutral-300 text-white font-medium rounded-md">
+            {{ busy === 'send' ? '…' : t('common.send') }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Reminder modal -->
+    <div v-if="reminderOpen" class="fixed inset-0 bg-neutral-900/40 z-50 flex items-center justify-center p-4" @click.self="reminderOpen = false">
+      <div class="bg-white rounded-xl shadow-lg max-w-md w-full p-5">
+        <h3 class="text-lg font-semibold mb-1">{{ t('invoice.modals.reminder_title') }}</h3>
+        <p class="text-sm text-warning-600 font-medium mb-3">{{ t('invoice.modals.reminder_overdue', { days: daysOverdue }) }}</p>
+        <p class="text-sm text-neutral-600 mb-3">{{ t('invoice.modals.reminder_body') }}</p>
+        <div v-if="invoice && (invoice.client_main_email || invoice.project_billing_emails?.length)" class="bg-neutral-50 border border-neutral-200 rounded-md px-3 py-2 mb-4 text-xs">
+          <div class="text-neutral-500 mb-0.5">{{ t('invoice.modals.reminder_recipients') }}</div>
+          <div v-if="invoice.client_main_email" class="font-mono">✉ {{ invoice.client_main_email }}</div>
+          <div v-for="b in invoice.project_billing_emails || []" :key="b.email" class="font-mono">
+            ✉ {{ b.email }}<span v-if="b.label" class="text-neutral-400"> ({{ b.label }})</span>
+          </div>
+        </div>
+        <div v-if="invoice && invoice.reminder_count > 0" class="text-xs text-neutral-500 mb-4">
+          {{ t('invoice.reminder_at', { count: invoice.reminder_count, date: formatDate(invoice.last_reminder_at) }) }}
+        </div>
+        <div class="flex justify-end gap-2">
+          <button @click="reminderOpen = false" class="cursor-pointer px-3 h-9 text-sm border border-neutral-300 rounded-md text-neutral-700 hover:bg-neutral-50">{{ t('common.cancel') }}</button>
+          <button @click="sendReminder" :disabled="busy !== null"
+            class="cursor-pointer px-4 h-9 text-sm bg-warning-500 hover:bg-warning-600 disabled:bg-neutral-300 text-white font-medium rounded-md">
+            {{ busy === 'reminder' ? '…' : t('invoice.send_reminder') }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div class="bg-white border border-neutral-200 rounded-lg p-5 shadow-sm">
+        <h3 class="text-sm font-semibold uppercase tracking-wide text-neutral-500 mb-3">{{ t('invoice.issue_date') }} / {{ t('invoice.tax_date') }} / {{ t('invoice.due_date') }}</h3>
+        <dl class="space-y-1.5 text-sm">
+          <div class="flex justify-between"><dt class="text-neutral-500">{{ t('invoice.issue_date') }}</dt><dd>{{ formatDate(invoice.issue_date) }}</dd></div>
+          <div v-if="invoice.tax_date" class="flex justify-between"><dt class="text-neutral-500">{{ t('invoice.tax_date') }}</dt><dd>{{ formatDate(invoice.tax_date) }}</dd></div>
+          <div class="flex justify-between"><dt class="text-neutral-500">{{ t('invoice.due_date') }}</dt><dd>{{ formatDate(invoice.due_date) }}</dd></div>
+          <div v-if="invoice.paid_at" class="flex justify-between"><dt class="text-neutral-500">{{ t('status.paid') }}</dt><dd>{{ formatDate(invoice.paid_at) }}</dd></div>
+        </dl>
+      </div>
+
+      <div class="bg-white border border-neutral-200 rounded-lg p-5 shadow-sm">
+        <h3 class="text-sm font-semibold uppercase tracking-wide text-neutral-500 mb-3">{{ t('common.currency') }} &amp; {{ t('invoice.totals.vat') }}</h3>
+        <dl class="space-y-1.5 text-sm">
+          <div class="flex justify-between"><dt class="text-neutral-500">{{ t('common.currency') }}</dt><dd class="font-mono">{{ invoice.currency }}</dd></div>
+          <div class="flex justify-between"><dt class="text-neutral-500">Jazyk</dt><dd>{{ invoice.language.toUpperCase() }}</dd></div>
+          <div class="flex justify-between"><dt class="text-neutral-500">Reverse charge</dt><dd>{{ invoice.reverse_charge ? 'ano' : 'ne' }}</dd></div>
+        </dl>
+      </div>
+
+      <div class="bg-white border border-neutral-200 rounded-lg p-5 shadow-sm">
+        <h3 class="text-sm font-semibold uppercase tracking-wide text-neutral-500 mb-3">{{ t('settings.account_cz') }}</h3>
+        <dl class="space-y-1 text-sm">
+          <div v-if="invoice.bank_account_number" class="font-mono text-xs">
+            {{ invoice.bank_account_number }} / {{ invoice.bank_code }}
+          </div>
+          <div v-if="invoice.bank_iban" class="font-mono text-xs break-all">{{ invoice.bank_iban }}</div>
+          <div v-if="invoice.bank_name" class="text-neutral-600">{{ invoice.bank_name }}</div>
+          <div v-if="!invoice.bank_account_number && !invoice.bank_iban" class="text-neutral-400 text-xs">
+            Bankovní spojení pro {{ invoice.currency }} není v Settings vyplněné
+          </div>
+        </dl>
+      </div>
+    </div>
+
+    <!-- Položky -->
+    <div class="bg-white border border-neutral-200 rounded-lg shadow-sm overflow-hidden">
+      <div class="px-5 py-3 border-b border-neutral-200">
+        <h3 class="text-sm font-semibold uppercase tracking-wide text-neutral-500">{{ t('invoice.items') }}</h3>
+      </div>
+      <table class="w-full text-sm">
+        <thead class="bg-neutral-50 text-xs text-neutral-500 uppercase tracking-wide">
+          <tr>
+            <th class="px-4 py-2 text-left font-medium">Popis</th>
+            <th class="px-4 py-2 text-right font-medium">{{ t('invoice.items_table.qty') }}</th>
+            <th class="px-4 py-2 text-left font-medium">Jed.</th>
+            <th class="px-4 py-2 text-right font-medium">Cena/j</th>
+            <th class="px-4 py-2 text-center font-medium">DPH</th>
+            <th class="px-4 py-2 text-right font-medium">Bez DPH</th>
+            <th class="px-4 py-2 text-right font-medium">S DPH</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-neutral-100">
+          <tr v-for="item in invoice.items" :key="item.id">
+            <td class="px-4 py-2.5 whitespace-pre-wrap">{{ item.description }}</td>
+            <td class="px-4 py-2.5 text-right font-mono">{{ item.quantity }}</td>
+            <td class="px-4 py-2.5 text-neutral-600">{{ item.unit }}</td>
+            <td class="px-4 py-2.5 text-right font-mono">{{ formatMoney(item.unit_price_without_vat, invoice.currency) }}</td>
+            <td class="px-4 py-2.5 text-center text-xs">{{ formatPercent(item.vat_rate_snapshot ?? 0) }}</td>
+            <td class="px-4 py-2.5 text-right font-mono">{{ formatMoney(item.total_without_vat ?? 0, invoice.currency) }}</td>
+            <td class="px-4 py-2.5 text-right font-mono font-medium">{{ formatMoney(item.total_with_vat ?? 0, invoice.currency) }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Sumace -->
+    <div class="bg-white border border-neutral-200 rounded-lg p-5 shadow-sm">
+      <h3 class="text-sm font-semibold uppercase tracking-wide text-neutral-500 mb-3">{{ t('invoice.summary') }}</h3>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <dl class="space-y-1 text-sm">
+          <div v-for="b in invoice.vat_breakdown" :key="b.rate" class="flex justify-between">
+            <dt class="text-neutral-500">Základ {{ formatPercent(b.rate) }}</dt>
+            <dd class="font-mono">{{ formatMoney(b.base, invoice.currency) }}</dd>
+          </div>
+          <div v-for="b in invoice.vat_breakdown" :key="'v'+b.rate" v-show="b.vat > 0" class="flex justify-between">
+            <dt class="text-neutral-500">DPH {{ formatPercent(b.rate) }}</dt>
+            <dd class="font-mono">{{ formatMoney(b.vat, invoice.currency) }}</dd>
+          </div>
+        </dl>
+        <dl class="space-y-1 text-sm">
+          <div class="flex justify-between font-semibold">
+            <dt>Bez DPH</dt>
+            <dd class="font-mono">{{ formatMoney(invoice.totals.without_vat, invoice.currency) }}</dd>
+          </div>
+          <div class="flex justify-between font-semibold">
+            <dt>DPH celkem</dt>
+            <dd class="font-mono">{{ formatMoney(invoice.totals.vat, invoice.currency) }}</dd>
+          </div>
+          <div class="flex justify-between border-t border-neutral-300 pt-2 mt-2 text-lg font-semibold text-primary-700">
+            <dt>Celkem</dt>
+            <dd class="font-mono">{{ formatMoney(invoice.totals.with_vat, invoice.currency) }}</dd>
+          </div>
+          <div v-if="invoice.advance_paid_amount > 0" class="flex justify-between text-sm text-neutral-600 pt-2">
+            <dt>{{ t('invoice.totals.advance_deduction') }}</dt>
+            <dd class="font-mono">−{{ formatMoney(invoice.advance_paid_amount, invoice.currency) }}</dd>
+          </div>
+          <div v-if="invoice.advance_paid_amount > 0" class="flex justify-between text-base font-semibold">
+            <dt>{{ t('invoice.amount_to_pay') }}</dt>
+            <dd class="font-mono">{{ formatMoney(invoice.amount_to_pay, invoice.currency) }}</dd>
+          </div>
+        </dl>
+      </div>
+    </div>
+
+    <div v-if="invoice.note_below_items" class="bg-white border border-neutral-200 rounded-lg p-5 shadow-sm">
+      <h3 class="text-sm font-semibold uppercase tracking-wide text-neutral-500 mb-2">{{ t('invoice.note') }}</h3>
+      <p class="text-sm text-neutral-700 whitespace-pre-wrap">{{ invoice.note_below_items }}</p>
+    </div>
+
+
+    <!-- Výkaz víceprací -->
+    <div v-if="workReport" class="bg-white border border-neutral-200 rounded-lg shadow-sm overflow-hidden">
+      <header class="px-5 py-3 border-b border-neutral-200 flex items-baseline justify-between gap-3">
+        <h3 class="text-sm font-semibold uppercase tracking-wide text-neutral-500">{{ t('invoice.work_report') }}</h3>
+        <span class="text-sm text-neutral-700">{{ workReport.title }}</span>
+      </header>
+      <table class="w-full text-sm">
+        <thead class="bg-neutral-50 text-neutral-500 text-xs uppercase tracking-wide">
+          <tr>
+            <th class="text-left px-5 py-2 font-medium">{{ t('invoice.wr_description') }}</th>
+            <th v-if="wrHasDates" class="text-left px-4 py-2 font-medium w-32">{{ t('invoice.wr_date') }}</th>
+            <th class="text-right px-4 py-2 font-medium w-28">{{ t('invoice.wr_hours') }}</th>
+            <th class="text-right px-4 py-2 font-medium w-32">{{ t('invoice.wr_rate') }}</th>
+            <th class="text-right px-5 py-2 font-medium w-36">{{ t('invoice.wr_total') }}</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-neutral-100">
+          <tr v-for="(it, i) in workReport.items" :key="i">
+            <td class="px-5 py-2 text-neutral-800 whitespace-pre-wrap">{{ it.description }}</td>
+            <td v-if="wrHasDates" class="px-4 py-2 text-neutral-600 whitespace-nowrap">{{ formatDate(it.work_date) }}</td>
+            <td class="px-4 py-2 text-right font-mono">{{ Number(it.hours).toLocaleString('cs', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) }}</td>
+            <td class="px-4 py-2 text-right font-mono">{{ formatMoney(it.rate, invoice.currency) }}</td>
+            <td class="px-5 py-2 text-right font-mono">{{ formatMoney(Number(it.hours) * Number(it.rate), invoice.currency) }}</td>
+          </tr>
+          <tr class="bg-neutral-50 font-semibold">
+            <td class="px-5 py-2 text-right" :colspan="wrHasDates ? 2 : 1">{{ t('invoice.totals.total') }}</td>
+            <td class="px-4 py-2 text-right font-mono">{{ workReport.total_hours.toLocaleString('cs', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) }} h</td>
+            <td></td>
+            <td class="px-5 py-2 text-right font-mono">{{ formatMoney(workReport.total_amount, invoice.currency) }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Aktivita -->
+    <div v-if="activity.length > 0" class="bg-white border border-neutral-200 rounded-lg shadow-sm overflow-hidden">
+      <header class="px-5 py-3 border-b border-neutral-200">
+        <h3 class="text-sm font-semibold uppercase tracking-wide text-neutral-500">{{ t('invoice.activity') }}</h3>
+      </header>
+      <ul class="divide-y divide-neutral-100">
+        <li v-for="a in activity" :key="a.id" class="px-5 py-2.5 text-sm flex items-center gap-3">
+          <span class="text-xs px-2 py-0.5 rounded font-medium" :class="actionColor(a.action)">{{ actionLabel(a.action) }}</span>
+          <span class="text-neutral-500 text-xs">{{ a.user_name || a.user_email || '—' }}</span>
+          <span class="text-neutral-400 text-xs flex-1">{{ a.created_at.replace('T', ' ').slice(0, 19) }}</span>
+          <span v-if="a.payload" class="text-xs text-neutral-500 truncate max-w-md">
+            {{ Object.entries(a.payload).map(([k, v]) => k + '=' + (typeof v === 'object' ? JSON.stringify(v) : String(v))).join(' · ') }}
+          </span>
+        </li>
+      </ul>
+    </div>
+
+    <!-- Sekundární akce — pod fakturou (Test odeslání + admin/destrukční) -->
+    <div v-if="!isDraft" class="bg-white border border-neutral-200 rounded-lg p-5 shadow-sm">
+      <h3 class="text-xs font-semibold uppercase tracking-wide text-neutral-500 mb-3">{{ t('invoice.more_actions') }}</h3>
+      <div class="flex flex-wrap gap-2">
+        <RouterLink :to="`/clients/${invoice.client_id}`"
+          class="cursor-pointer px-3 h-9 text-sm border border-neutral-300 text-neutral-700 hover:bg-neutral-50 rounded-md inline-flex items-center gap-1.5">
+          <svg class="w-4 h-4 text-neutral-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M16 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0zM12 14a7 7 0 0 0-7 7h14a7 7 0 0 0-7-7z"/></svg>
+          {{ t('invoice.client_detail') }}
+        </RouterLink>
+
+        <button v-if="canSendTest" @click="sendTest" :disabled="busy !== null"
+          class="cursor-pointer px-3 h-9 text-sm border border-primary-300 rounded-md text-primary-600 hover:bg-primary-50 disabled:opacity-50 inline-flex items-center gap-1.5">
+          <svg class="w-4 h-4 text-primary-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 1 1 7.072 0l-.548.547A3.374 3.374 0 0 0 14 18.469V19a2 2 0 1 1-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"/></svg>
+          {{ busy === 'send-test' ? '…' : t('invoice.send_test') }}
+        </button>
+
+        <button v-if="canSendTestReminder" @click="sendTestReminder" :disabled="busy !== null"
+          class="cursor-pointer px-3 h-9 text-sm border border-warning-500/40 rounded-md text-warning-600 hover:bg-warning-50 disabled:opacity-50 inline-flex items-center gap-1.5">
+          <svg class="w-4 h-4 text-warning-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01M5.07 19h13.86c1.54 0 2.5-1.67 1.73-3L13.73 4a2 2 0 0 0-3.46 0L3.34 16c-.77 1.33.19 3 1.73 3z"/></svg>
+          {{ busy === 'send-test-reminder' ? '…' : t('invoice.send_test_reminder') }}
+        </button>
+
+        <button v-if="isAdmin && !['cancellation'].includes(invoice.invoice_type)" @click="editIssued" :disabled="busy !== null"
+          class="cursor-pointer px-3 h-9 text-sm border border-warning-500/50 text-warning-600 hover:bg-warning-50 rounded-md inline-flex items-center gap-1.5">
+          <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01M5.07 19h13.86c1.54 0 2.5-1.67 1.73-3L13.73 4a2 2 0 0 0-3.46 0L3.34 16c-.77 1.33.19 3 1.73 3z"/></svg>
+          {{ t('invoice.edit_admin') }}
+        </button>
+
+        <button v-if="canCancel" @click="cancelOpen = true" :disabled="busy !== null"
+          class="cursor-pointer px-3 h-9 text-sm border border-danger-500/50 text-danger-500 hover:bg-danger-50 rounded-md inline-flex items-center gap-1.5">
+          <svg class="w-4 h-4 text-danger-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10 11v6m4-6v6m1 5H9a2 2 0 0 1-2-2V7h10v13a2 2 0 0 1-2 2zM5 7h14l-1-3H6L5 7z"/></svg>
+          {{ t('invoice.cancel_or_credit') }}
+        </button>
+      </div>
+    </div>
+  </div>
+</template>

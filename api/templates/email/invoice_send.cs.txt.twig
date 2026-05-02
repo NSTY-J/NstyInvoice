@@ -1,0 +1,18 @@
+{% extends '_layout.txt.twig' %}
+
+{% block content %}
+{% if is_test %}[TEST] {% endif %}{{ greeting }}
+------------
+
+{{ intro_plain }}
+
+Variabilní symbol: {{ invoice.varsymbol }}
+Datum vystavení:   {{ invoice.issue_date|date('j.n.Y') }}
+Splatnost:         {{ invoice.due_date|date('j.n.Y') }}
+K úhradě:          {{ amount_to_pay|number_format(2, ',', ' ') }} {{ invoice.currency }}
+
+Faktura v PDF je v příloze tohoto emailu.
+
+{% if not is_test %}Děkujeme za spolupráci.
+{% else %}=== TEST EMAIL — klient ho nedostal. ==={% endif %}
+{% endblock %}

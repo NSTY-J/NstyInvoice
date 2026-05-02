@@ -1,0 +1,27 @@
+.git
+.gitignore
+.vscode
+.claude
+.idea
+*.md
+
+# Will be rebuilt inside image
+api/vendor
+web/node_modules
+web/dist
+
+# Local-only
+cfg.php
+cfg.local.php
+log
+storage
+private
+aspnet_client
+
+# Web server configs (Docker uses Apache directly via .htaccess)
+web.config
+
+# Build artefacts
+*.log
+.DS_Store
+Thumbs.db

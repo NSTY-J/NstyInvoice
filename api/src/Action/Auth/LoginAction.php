@@ -1,0 +1,171 @@
+<?php
+
+declare(strict_types=1);
+
+namespace MyInvoice\Action\Auth;
+
+use MyInvoice\Http\Json;
+use MyInvoice\Infrastructure\Config\Config;
+use MyInvoice\Infrastructure\Database\Connection;
+use MyInvoice\Service\ActivityLogger;
+use MyInvoice\Service\Auth\BruteForceGuard;
+use MyInvoice\Service\Auth\PasswordHasher;
+use MyInvoice\Service\Auth\SecretEncryption;
+use MyInvoice\Service\Auth\SessionManager;
+use MyInvoice\Service\Auth\TotpService;
+use MyInvoice\Service\Captcha\TurnstileVerifier;
+use MyInvoice\Service\IpMatcher;
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+
+final class LoginAction
+{
+    public function __construct(
+        private readonly Connection $db,
+        private readonly PasswordHasher $hasher,
+        private readonly SessionManager $sessions,
+        private readonly BruteForceGuard $bf,
+        private readonly TurnstileVerifier $turnstile,
+        private readonly ActivityLogger $logger,
+        private readonly IpMatcher $ipMatcher,
+        private readonly Config $config,
+        private readonly TotpService $totp,
+        private readonly SecretEncryption $crypto,
+    ) {}
+
+    public function __invoke(Request $request, Response $response): Response
+    {
+        $body = (array) ($request->getParsedBody() ?? []);
+        $email = trim((string) ($body['email'] ?? ''));
+        $password = (string) ($body['password'] ?? '');
+        $totpCode = isset($body['totp']) ? trim((string) $body['totp']) : '';
+        $turnstileToken = isset($body['cf_turnstile_response']) ? (string) $body['cf_turnstile_response'] : null;
+
+        $ip        = $this->ipMatcher->clientIpFromRequest($request->getServerParams());
+        $userAgent = $request->getHeaderLine('User-Agent');
+
+        if ($email === '' || $password === '') {
+            return Json::error($response, 'invalid_credentials', 'Neplatné přihlašovací údaje.', 401);
+        }
+
+        // Brute-force check
+        $state = $this->bf->check($email, $ip);
+
+        if ($state === BruteForceGuard::STATE_LOCKED_24H || $state === BruteForceGuard::STATE_LOCKED_15M) {
+            $this->logger->log('auth.login_locked', null, null, null, [
+                'email' => $email, 'ip' => $ip, 'state' => $state,
+            ], $ip, $userAgent);
+            return Json::error(
+                $response,
+                'too_many_attempts',
+                $state === BruteForceGuard::STATE_LOCKED_24H
+                    ? 'Účet je zablokovaný na 24 hodin kvůli mnoha selháním.'
+                    : 'Účet je zablokovaný na 15 minut kvůli mnoha selháním.',
+                429,
+            );
+        }
+
+        // Turnstile vždy aktivní — Cloudflare sám rozhoduje (auto-pass nebo interactive challenge).
+        // No-op pokud captcha.provider != 'turnstile' nebo chybí secret_key (TurnstileVerifier).
+        if (!$this->turnstile->verify($turnstileToken ?? '', $ip, 'login')) {
+            $this->logger->log('auth.captcha_failed', null, null, null, [
+                'email' => $email, 'ip' => $ip,
+            ], $ip, $userAgent);
+            $this->bf->recordFailure($email, $ip);
+            return Json::error($response, 'captcha_failed', 'CAPTCHA selhala.', 400);
+        }
+
+        // Načti usera (vždy zavolej dummyVerify pokud user neexistuje → konstantní timing)
+        $stmt = $this->db->pdo()->prepare('SELECT id, email, name, role, locale, password_hash, is_active, totp_secret, totp_enabled FROM users WHERE email = ? LIMIT 1');
+        $stmt->execute([$email]);
+        $user = $stmt->fetch(\PDO::FETCH_ASSOC);
+
+        if (!$user || (int) $user['is_active'] === 0) {
+            $this->hasher->dummyVerify();
+            $this->bf->recordFailure($email, $ip);
+            $this->logger->log('auth.login_failed', null, null, null, [
+                'email' => $email, 'reason' => $user ? 'user_inactive' : 'user_not_found',
+            ], $ip, $userAgent);
+            return Json::error($response, 'invalid_credentials', 'Neplatné přihlašovací údaje.', 401);
+        }
+
+        if (!$this->hasher->verify($password, (string) $user['password_hash'])) {
+            $this->bf->recordFailure($email, $ip);
+            $this->logger->log('auth.login_failed', (int) $user['id'], 'user', (int) $user['id'], [
+                'email' => $email, 'reason' => 'wrong_password',
+            ], $ip, $userAgent);
+            return Json::error($response, 'invalid_credentials', 'Neplatné přihlašovací údaje.', 401);
+        }
+
+        // TOTP — pokud má user aktivní 2FA, vyžaduj kód
+        if ((int) $user['totp_enabled'] === 1 && !empty($user['totp_secret'])) {
+            if ($totpCode === '') {
+                // Nepočítej jako fail — uživatel zadal heslo OK, jen čekáme na 2FA
+                return Json::error($response, 'totp_required', 'TOTP kód požadován.', 401);
+            }
+            // Per-user TOTP lockout — chrání 10⁶ keyspace proti brute-force
+            if ($this->bf->isTotpLocked((int) $user['id'])) {
+                $this->logger->log('auth.totp_locked', (int) $user['id'], 'user', (int) $user['id'], [
+                    'email' => $email,
+                ], $ip, $userAgent);
+                return Json::error($response, 'too_many_attempts', 'Příliš mnoho TOTP pokusů. Zkus to později.', 429);
+            }
+            $totpSecret = $this->crypto->decrypt((string) $user['totp_secret']);
+            if (!$this->totp->verify($totpSecret, $totpCode)) {
+                $this->bf->recordTotpFailure((int) $user['id']);
+                $this->bf->recordFailure($email, $ip);
+                $this->logger->log('auth.login_failed', (int) $user['id'], 'user', (int) $user['id'], [
+                    'email' => $email, 'reason' => 'totp_invalid',
+                ], $ip, $userAgent);
+                return Json::error($response, 'invalid_totp', 'Neplatný TOTP kód.', 401);
+            }
+            $this->bf->recordTotpSuccess((int) $user['id']);
+        }
+
+        // Rehash pokud zastaral cost
+        if ($this->hasher->needsRehash((string) $user['password_hash'])) {
+            $newHash = $this->hasher->hash($password);
+            $this->db->pdo()->prepare('UPDATE users SET password_hash = ? WHERE id = ?')
+                ->execute([$newHash, (int) $user['id']]);
+        }
+
+        $this->bf->recordSuccess($email, $ip);
+
+        // Vytvoř session
+        $session = $this->sessions->create((int) $user['id'], $ip, $userAgent);
+
+        // Update last_login_at + last_login_ip + last_login_ua
+        $this->db->pdo()->prepare('UPDATE users SET last_login_at = NOW(), last_login_ip = ?, last_login_ua = ? WHERE id = ?')
+            ->execute([@inet_pton($ip) ?: null, substr($userAgent, 0, 255), (int) $user['id']]);
+
+        $this->logger->log('auth.login', (int) $user['id'], 'user', (int) $user['id'], [
+            'email' => $email,
+        ], $ip, $userAgent);
+
+        // Session cookie
+        $cookieName    = (string) $this->config->get('session.cookie_name', '__Host-myinvoice_session');
+        $cookieSecure  = (bool) $this->config->get('session.cookie_secure', true);
+        $cookieSameSite = (string) $this->config->get('session.cookie_samesite', 'Lax');
+        $maxAge = max(0, $session['expires_at'] - time());
+
+        $cookie = sprintf(
+            '%s=%s; HttpOnly; Path=/; Max-Age=%d; SameSite=%s%s',
+            $cookieName,
+            $session['token'],
+            $maxAge,
+            $cookieSameSite,
+            $cookieSecure ? '; Secure' : '',
+        );
+
+        return Json::ok($response, [
+            'user' => [
+                'id'     => (int) $user['id'],
+                'email'  => $user['email'],
+                'name'   => $user['name'],
+                'role'   => $user['role'],
+                'locale' => $user['locale'],
+            ],
+            'csrf_token' => $session['csrf_token'],
+        ])->withHeader('Set-Cookie', $cookie);
+    }
+}
