@@ -94,12 +94,33 @@ alternativa s důrazem na:
 
 ## Quick start: Docker (3 minuty)
 
-Nejrychlejší cesta od `git clone` k běžící aplikaci. Stačí mít nainstalovaný
-**Docker Desktop** (Windows / macOS) nebo **Docker Engine + compose-plugin** (Linux) —
-nepotřebuješ lokálně PHP, MariaDB, Node ani nic dalšího.
+Nejrychlejší cesta k běžící aplikaci. Stačí mít nainstalovaný **Docker Desktop**
+(Windows / macOS) nebo **Docker Engine + compose-plugin** (Linux) — nepotřebuješ
+lokálně PHP, MariaDB, Node ani nic dalšího.
+
+### Varianta A — pre-built image z GHCR (bez klonování repa)
 
 ```bash
-git clone <repo-url> myinvoice
+# Stáhni si docker-compose.yml a setup script
+curl -O https://raw.githubusercontent.com/radekhulan/myinvoice/master/docker-compose.yml
+curl -O https://raw.githubusercontent.com/radekhulan/myinvoice/master/cfg.sample.php
+
+# Uprav docker-compose.yml: nahraď `build: .` za:
+#   image: ghcr.io/radekhulan/myinvoice:latest
+# (nebo konkrétní verzi: ghcr.io/radekhulan/myinvoice:1.2.0)
+
+cp cfg.sample.php cfg.docker.php   # pak vyplň DB host=db, app.pepper a secret_encryption_key
+docker compose up -d
+docker compose exec app php api/bin/migrate.php
+```
+
+Image jsou multi-arch (`linux/amd64` + `linux/arm64`) — funguje na běžném
+Linux serveru i na M1/M2 Macu nebo Raspberry Pi 4/5.
+
+### Varianta B — build z source
+
+```bash
+git clone https://github.com/radekhulan/myinvoice.git
 cd myinvoice
 
 # Linux / macOS
