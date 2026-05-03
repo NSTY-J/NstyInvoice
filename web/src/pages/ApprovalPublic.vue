@@ -288,7 +288,7 @@ async function submit(decision: 'approve' | 'reject') {
             <!-- Akce: review -->
             <div v-if="mode === 'review'" class="flex flex-col gap-3">
               <button @click="approve" :disabled="submitting"
-                class="cursor-pointer w-full py-4 bg-red-600 hover:bg-red-700 disabled:bg-neutral-300 text-white text-lg font-bold rounded-lg shadow-sm transition">
+                class="cursor-pointer w-full py-4 bg-emerald-700 hover:bg-emerald-800 disabled:bg-neutral-300 text-white text-lg font-bold rounded-lg shadow-sm transition">
                 {{ submitting ? tt('Odesílám…', 'Submitting…') : tt('✓ Schválit vícepráce', '✓ Approve work report') }}
               </button>
               <button @click="startReject" :disabled="submitting"

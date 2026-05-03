@@ -15,13 +15,12 @@ const overdueOnly = ref(false)
 const items = ref<ApprovalInboxItem[]>([])
 const loading = ref(true)
 
+// Fetch vždy všechno (status=all, bez overdue filtru) → filtrování děláme
+// lokálně. Tím máme přesné counts ve všech filtrech a klik na badge je instant.
 async function load() {
   loading.value = true
   try {
-    items.value = await adminApi.listApprovals({
-      status: statusFilter.value,
-      overdue_days: overdueOnly.value ? 5 : undefined,
-    })
+    items.value = await adminApi.listApprovals({ status: 'all' })
   } catch (e: any) {
     toast.error(e?.response?.data?.error?.message || t('errors.generic'))
   } finally {
@@ -30,6 +29,21 @@ async function load() {
 }
 
 onMounted(load)
+
+const filteredItems = computed(() => {
+  let result = items.value
+  if (statusFilter.value !== 'all') {
+    result = result.filter(i => i.approval_status === statusFilter.value)
+  }
+  if (overdueOnly.value) {
+    const fiveDaysAgo = Date.now() - 5 * 86_400_000
+    result = result.filter(i => {
+      const last = i.approval_reminder_at || i.approval_requested_at
+      return last && new Date(last).getTime() <= fiveDaysAgo
+    })
+  }
+  return result
+})
 
 function badgeClass(s: ApprovalInboxItem): string {
   if (s.approval_status === 'requested') {
@@ -58,6 +72,7 @@ function daysSince(date: string | null): number | null {
   return Math.floor(ms / 86_400_000)
 }
 
+// Counts z všech načtených itemů (bez filtru) — vždy přesné
 const counts = computed(() => ({
   requested: items.value.filter(i => i.approval_status === 'requested').length,
   approved:  items.value.filter(i => i.approval_status === 'approved').length,
@@ -76,28 +91,25 @@ const counts = computed(() => ({
     <!-- Filtry -->
     <div class="bg-white border border-neutral-200 rounded-lg p-3 mb-4 flex flex-wrap items-center gap-2">
       <button v-for="opt in (['requested','approved','rejected','all'] as const)" :key="opt"
-        @click="statusFilter = opt; load()"
-        class="cursor-pointer px-3 h-8 text-xs rounded-md font-medium border"
+        @click="statusFilter = opt"
+        class="cursor-pointer px-3 h-8 text-xs rounded-md font-medium border inline-flex items-center gap-1.5"
         :class="statusFilter === opt
           ? 'bg-primary-600 text-white border-primary-600'
           : 'bg-white text-neutral-700 border-neutral-300 hover:bg-neutral-50'">
         {{ t('approval_inbox.filter_' + opt) }}
+        <span class="text-xs opacity-80">({{ opt === 'all' ? counts.total : counts[opt] }})</span>
       </button>
       <span class="ml-2 text-xs text-neutral-400">·</span>
       <label class="flex items-center gap-2 text-sm text-neutral-700 cursor-pointer ml-2">
-        <input v-model="overdueOnly" type="checkbox" @change="load"
+        <input v-model="overdueOnly" type="checkbox"
           class="rounded border-neutral-300 text-primary-600" />
         {{ t('approval_inbox.overdue_only') }}
       </label>
-      <span class="flex-1"></span>
-      <span class="text-xs text-neutral-500">
-        {{ t('approval_inbox.counts', counts) }}
-      </span>
     </div>
 
     <div v-if="loading" class="text-center text-neutral-500 py-12 text-sm">{{ t('common.loading') }}</div>
 
-    <div v-else-if="items.length === 0"
+    <div v-else-if="filteredItems.length === 0"
       class="bg-white border border-neutral-200 rounded-lg p-12 text-center text-sm text-neutral-500">
       {{ t('approval_inbox.empty') }}
     </div>
@@ -117,7 +129,7 @@ const counts = computed(() => ({
           </tr>
         </thead>
         <tbody class="divide-y divide-neutral-100">
-          <tr v-for="r in items" :key="r.id" class="hover:bg-neutral-50">
+          <tr v-for="r in filteredItems" :key="r.id" class="hover:bg-neutral-50">
             <td class="px-3 py-2">
               <RouterLink :to="`/invoices/${r.id}`" class="font-mono text-primary-700 hover:underline">
                 {{ r.varsymbol || '#' + r.id }}
