@@ -104,6 +104,12 @@ onMounted(async () => {
   await Promise.all([loadClients(), loadStats(), load(true)])
 })
 
+function emailsFor(p: Project): string {
+  const all = [p.client_main_email, ...(p.billing_emails ?? []).map(b => b.email)]
+    .filter((e): e is string => !!e && e.trim() !== '')
+  return Array.from(new Set(all)).join(', ')
+}
+
 watch([status, clientId, sort], () => load(true))
 </script>
 
@@ -166,7 +172,12 @@ watch([status, clientId, sort], () => load(true))
           <tr v-for="p in items" :key="p.id" class="cursor-pointer hover:bg-neutral-50"
               @click="router.push(`/projects/${p.id}`)">
             <td class="px-4 py-3 font-medium">{{ p.name }}</td>
-            <td class="px-4 py-3 text-neutral-600">{{ p.client_company_name }}</td>
+            <td class="px-4 py-3 text-neutral-600">
+              <div>{{ p.client_company_name }}</div>
+              <div v-if="emailsFor(p)" class="text-xs text-neutral-400 mt-0.5 truncate max-w-xs" :title="emailsFor(p)">
+                {{ emailsFor(p) }}
+              </div>
+            </td>
             <td class="px-4 py-3">
               <span class="text-xs px-2 py-0.5 rounded"
                 :class="{
@@ -185,7 +196,7 @@ watch([status, clientId, sort], () => load(true))
               <span v-if="p.last_invoice_date">{{ formatDate(p.last_invoice_date) }}</span>
               <span v-else class="text-neutral-300">—</span>
             </td>
-            <td class="px-4 py-3 text-right font-mono">{{ p.hourly_rate.toLocaleString('cs') }} {{ p.currency }}/h</td>
+            <td class="px-4 py-3 text-right font-mono whitespace-nowrap">{{ p.hourly_rate.toLocaleString('cs') }} {{ p.currency }}/h</td>
           </tr>
         </tbody>
       </table>

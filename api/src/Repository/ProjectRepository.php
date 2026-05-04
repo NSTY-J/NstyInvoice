@@ -82,6 +82,7 @@ final class ProjectRepository
         $offset = max(0, ($page - 1) * $perPage);
         // Cache `project_revenue_cache` per měnu projektu (přepočítáváno přes StatsRecomputer)
         $sql = "SELECT p.*, c.company_name AS client_company_name,
+                       c.main_email AS client_main_email,
                        cur.code AS currency,
                        COALESCE(prc.revenue, 0) AS revenue,
                        prc.last_invoice_date,
@@ -103,8 +104,14 @@ final class ProjectRepository
         $stmt->execute();
         $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
+        $emailsByProject = $this->billingEmailsForMany(array_map(static fn (array $r) => (int) $r['id'], $rows));
+
         return [
-            'data' => array_map(fn (array $r) => $this->cast($r), $rows),
+            'data' => array_map(function (array $r) use ($emailsByProject) {
+                $r = $this->cast($r);
+                $r['billing_emails'] = $emailsByProject[(int) $r['id']] ?? [];
+                return $r;
+            }, $rows),
             'meta' => [
                 'total'    => $total,
                 'page'     => $page,
@@ -219,6 +226,33 @@ final class ProjectRepository
             'email'    => $r['email'],
             'label'    => $r['label'],
         ], $rows);
+    }
+
+    /**
+     * @param int[] $projectIds
+     * @return array<int, array<int, array{position:int,email:string,label:?string}>>
+     */
+    private function billingEmailsForMany(array $projectIds): array
+    {
+        if (!$projectIds) return [];
+        $placeholders = implode(',', array_fill(0, count($projectIds), '?'));
+        $stmt = $this->db->pdo()->prepare(
+            "SELECT project_id, position, email, label
+               FROM project_billing_emails
+              WHERE project_id IN ($placeholders)
+              ORDER BY project_id, position"
+        );
+        $stmt->execute(array_map('intval', $projectIds));
+        $out = [];
+        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $r) {
+            $pid = (int) $r['project_id'];
+            $out[$pid][] = [
+                'position' => (int) $r['position'],
+                'email'    => $r['email'],
+                'label'    => $r['label'],
+            ];
+        }
+        return $out;
     }
 
     private function saveBillingEmails(int $projectId, array $emails): void
