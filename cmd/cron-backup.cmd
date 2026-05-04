@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================================
-REM  cron-backup.cmd — denni DB backup (mariadb-dump → gzip)
+REM  cron-backup.cmd — denni DB backup (mariadb-dump → ZIP)
 REM  Frekvence: 1x denne, doporuceno 02:00 (PRED cron-cleanup)
 REM  Retention: 30 dennich + 12 mesicnich (1. v mesici se zachova deze)
 REM

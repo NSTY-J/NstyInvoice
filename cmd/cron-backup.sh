@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  cron-backup.sh — denní DB backup (mariadb-dump → gzip)
+#  cron-backup.sh — denní DB backup (mariadb-dump → ZIP)
 #  Frekvence: 1× denně, doporučeno 02:00 (PŘED cron-cleanup)
 #  Retention: 30 denních + 12 měsíčních (1. v měsíci se zachová déle)
 #
