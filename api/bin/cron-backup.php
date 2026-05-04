@@ -82,48 +82,70 @@ file_put_contents($cnf, sprintf(
 ));
 @chmod($cnf, 0600);
 
-$errFile = $rootDir . '/storage/backup/.last-error';
-$cmd = sprintf(
-    '%s --defaults-extra-file=%s --single-transaction --quick --routines --triggers %s 2>%s',
-    escapeshellcmd($tool),
-    escapeshellarg($cnf),
-    escapeshellarg($dbName),
-    escapeshellarg($errFile)
-);
+$errFile     = $rootDir . '/storage/backup/.last-error';
+$skipRoutines = (bool) $config->get('db.backup_skip_routines', false);
 
-// 1) dump do dočasného .sql souboru
-$out = fopen($sqlTmp, 'wb');
-if (!$out) {
-    @unlink($cnf);
-    fwrite(STDERR, "Cannot open temp SQL for writing: $sqlTmp\n");
-    exit(1);
-}
-$proc = proc_open(
-    $cmd,
-    [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
-    $pipes,
-    $rootDir
-);
-if (!is_resource($proc)) {
+$runDump = static function (bool $withRoutines) use ($tool, $cnf, $dbName, $errFile, $sqlTmp, $rootDir): array {
+    @unlink($errFile);
+    $routinesFlag = $withRoutines ? '--routines --triggers' : '--skip-routines --triggers';
+    $cmd = sprintf(
+        '%s --defaults-extra-file=%s --single-transaction --quick %s %s 2>%s',
+        escapeshellcmd($tool),
+        escapeshellarg($cnf),
+        $routinesFlag,
+        escapeshellarg($dbName),
+        escapeshellarg($errFile)
+    );
+    $out = fopen($sqlTmp, 'wb');
+    if (!$out) return [1, "cannot open temp SQL: $sqlTmp"];
+
+    $proc = proc_open(
+        $cmd,
+        [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+        $pipes,
+        $rootDir
+    );
+    if (!is_resource($proc)) {
+        fclose($out);
+        return [1, 'cannot start backup process'];
+    }
+    fclose($pipes[0]);
+    fclose($pipes[2]);
+    while (!feof($pipes[1])) {
+        $chunk = fread($pipes[1], 65536);
+        if ($chunk === false || $chunk === '') break;
+        fwrite($out, $chunk);
+    }
+    fclose($pipes[1]);
+    $rc = proc_close($proc);
     fclose($out);
-    @unlink($cnf); @unlink($sqlTmp);
-    fwrite(STDERR, "Cannot start backup process.\n");
-    exit(1);
+
+    $err = is_file($errFile) ? trim((string) file_get_contents($errFile)) : '';
+    return [$rc, $err];
+};
+
+// 1) dump do dočasného .sql souboru — primární pokus
+[$rc, $err] = $runDump(!$skipRoutines);
+
+// Auto-fallback: pokud user nemá oprávnění na SHOW CREATE PROCEDURE/FUNCTION,
+// retry bez routines a hlasitě varuj.
+$privIssue = !$skipRoutines
+    && stripos($err, 'insufficient privileges') !== false
+    && (stripos($err, 'PROCEDURE') !== false || stripos($err, 'FUNCTION') !== false);
+if ($rc !== 0 && $privIssue) {
+    fwrite(STDERR, "[WARN] mariadb-dump nemá privilegia pro stored procedures/functions:\n  $err\n");
+    fwrite(STDERR, "[WARN] Retry BEZ --routines (procedury/funkce v této záloze NEBUDOU).\n");
+    fwrite(STDERR, "[HINT] Pro plný backup grantni privilege, např.:\n");
+    fwrite(STDERR, "  GRANT SELECT ON mysql.proc TO '$dbUser'@'%';\n");
+    fwrite(STDERR, "  -- nebo pro MariaDB 10.5+:\n");
+    fwrite(STDERR, "  GRANT SHOW CREATE ROUTINE ON $dbName.* TO '$dbUser'@'%';\n");
+    fwrite(STDERR, "  -- nebo trvale: db.backup_skip_routines = true v cfg.php\n");
+    [$rc, $err] = $runDump(false);
 }
-fclose($pipes[0]);
-fclose($pipes[2]);
-while (!feof($pipes[1])) {
-    $chunk = fread($pipes[1], 65536);
-    if ($chunk === false || $chunk === '') break;
-    fwrite($out, $chunk);
-}
-fclose($pipes[1]);
-$rc = proc_close($proc);
-fclose($out);
+
 @unlink($cnf);
 
 if ($rc !== 0 || !is_file($sqlTmp) || filesize($sqlTmp) < 100) {
-    $err = is_file($errFile) ? trim((string) file_get_contents($errFile)) : '';
     fwrite(STDERR, "Backup selhal (rc=$rc)" . ($err !== '' ? ": $err" : '') . "\n");
     @unlink($sqlTmp);
     exit(1);
