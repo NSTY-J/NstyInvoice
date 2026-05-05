@@ -100,11 +100,29 @@ function actionColor(a: string): string {
 }
 
 async function deleteInvoice() {
-  if (!invoice.value || invoice.value.status !== 'draft') return
-  if (!confirm(t('invoice.delete_draft_confirm'))) return
+  if (!invoice.value) return
+  // Dynamický warning podle statusu — force-delete vystavené/storno faktury
+  // odmítá backend pro non-admin role; UI tlačítko se admin-only stejně skryje.
+  const status = invoice.value.status
+  let confirmKey: string
+  switch (status) {
+    case 'draft':     confirmKey = 'invoice.delete_draft_confirm';     break
+    case 'cancelled': confirmKey = 'invoice.delete_cancelled_confirm'; break
+    case 'paid':      confirmKey = 'invoice.delete_paid_confirm';      break
+    case 'sent':      confirmKey = 'invoice.delete_sent_confirm';      break
+    case 'issued':
+    default:          confirmKey = 'invoice.delete_issued_confirm';    break
+  }
+  if (!confirm(t(confirmKey, { varsymbol: invoice.value.varsymbol || `#${invoice.value.id}` }))) return
   busy.value = 'delete'
   try {
-    await invoicesApi.delete(invoice.value.id)
+    const res = await invoicesApi.delete(invoice.value.id)
+    // Pokud cascade smazal i děti (storno/dobropis), informuj uživatele
+    if (res?.cascade_deleted && res.cascade_deleted > 0) {
+      toast.success(t('invoice.deleted_with_cascade', { n: res.cascade_deleted }))
+    } else {
+      toast.success(t('common.deleted'))
+    }
     router.push('/invoices')
   } catch (e: any) {
     toast.error( e?.response?.data?.error?.message || t('invoice.delete_failed'))
@@ -286,6 +304,15 @@ async function send() {
 }
 
 const isDraft = computed(() => invoice.value?.status === 'draft')
+// Smazat smají: draft = všichni kromě readonly; ostatní status = jen admin (force-delete
+// účetního dokladu). Backend má stejný guard — UI ho jen reflektuje.
+const canDelete = computed(() => {
+  if (!invoice.value) return false
+  const role = auth.user?.role
+  if (role === 'readonly') return false
+  if (invoice.value.status === 'draft') return true
+  return role === 'admin'
+})
 const isProforma = computed(() => invoice.value?.invoice_type === 'proforma')
 const canIssueFinal = computed(() => isProforma.value && invoice.value?.status === 'paid')
 const isIssued = computed(() => invoice.value && ['issued', 'sent', 'reminded'].includes(invoice.value.status))
@@ -477,10 +504,16 @@ async function updateApprovalStatus() {
           <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"/></svg>
           {{ busy === 'issue' ? '…' : t('invoice.issue') }}
         </button>
-        <button v-if="isDraft" @click="deleteInvoice" :disabled="busy !== null"
-          class="cursor-pointer px-3 h-9 text-sm border border-danger-500/50 text-danger-500 hover:bg-danger-50 rounded-md inline-flex items-center gap-1.5">
+        <button v-if="canDelete" @click="deleteInvoice" :disabled="busy !== null"
+          :title="!isDraft ? t('invoice.delete_force_title') : ''"
+          :class="[
+            'cursor-pointer px-3 h-9 text-sm rounded-md inline-flex items-center gap-1.5',
+            isDraft
+              ? 'border border-danger-500/50 text-danger-500 hover:bg-danger-50'
+              : 'border border-danger-500 bg-danger-50 text-danger-600 hover:bg-danger-100'
+          ]">
           <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0 1 16.138 21H7.862a2 2 0 0 1-1.995-1.858L5 7m5 4v6m4-6v6M1 7h22M9 7V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v3"/></svg>
-          {{ t('common.delete') }}
+          {{ isDraft ? t('common.delete') : t('invoice.delete_force_short') }}
         </button>
 
         <!-- Klonovat -->

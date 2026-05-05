@@ -273,7 +273,11 @@ export const invoicesApi = {
   create: (payload: InvoicePayload) => api.post<Invoice>('/invoices', payload).then(r => r.data),
   update: (id: number, payload: InvoicePayload, force = false) =>
     api.put<Invoice>(`/invoices/${id}${force ? '?force=1' : ''}`, payload).then(r => r.data),
-  delete: (id: number) => api.delete(`/invoices/${id}`),
+  /**
+   * Smazání faktury. Vrací `cascade_deleted` = počet navazujících dokladů
+   * (storno, dobropis), které byly smazány zaroven (ON DELETE CASCADE).
+   */
+  delete: (id: number) => api.delete<{ ok: boolean; cascade_deleted: number }>(`/invoices/${id}`).then(r => r.data),
 
   // Akce nad fakturou
   issue:    (id: number) => api.post<Invoice>(`/invoices/${id}/issue`).then(r => r.data),

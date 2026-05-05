@@ -6,6 +6,7 @@ import { formatMoney, formatDate, formatMonth, statusLabel, typeLabel, statusBad
 import { useHotkey } from '@/composables/useHotkey'
 import { useToast } from '@/composables/useToast'
 import { useI18n } from 'vue-i18n'
+import { useAuthStore } from '@/stores/auth'
 import { clientsApi, type Client } from '@/api/clients'
 import { codebooksApi, type Currency } from '@/api/codebooks'
 import TableSkeleton from '@/components/ui/TableSkeleton.vue'
@@ -16,6 +17,40 @@ const { t, tm, rt } = useI18n()
 const toast = useToast()
 
 useHotkey('ctrl+n', (e) => { e.preventDefault(); router.push('/invoices/new') })
+
+const auth = useAuthStore()
+function canDeleteInvoice(inv: InvoiceListItem): boolean {
+  const role = auth.user?.role
+  if (role === 'readonly') return false
+  if (inv.status === 'draft') return true
+  return role === 'admin'
+}
+
+async function deleteInvoiceRow(inv: InvoiceListItem) {
+  // Confirm text se mění dle status — vystavená / stornovaná má důraznější warning,
+  // protože se smaže i účetní doklad (a cascade i navazující storno/dobropis).
+  let confirmKey: string
+  switch (inv.status) {
+    case 'draft':     confirmKey = 'invoice.delete_draft_confirm';     break
+    case 'cancelled': confirmKey = 'invoice.delete_cancelled_confirm'; break
+    case 'paid':      confirmKey = 'invoice.delete_paid_confirm';      break
+    case 'sent':      confirmKey = 'invoice.delete_sent_confirm';      break
+    case 'issued':
+    default:          confirmKey = 'invoice.delete_issued_confirm';    break
+  }
+  if (!confirm(t(confirmKey, { varsymbol: inv.varsymbol || `#${inv.id}` }))) return
+  try {
+    const res = await invoicesApi.delete(inv.id)
+    if (res?.cascade_deleted && res.cascade_deleted > 0) {
+      toast.success(t('invoice.deleted_with_cascade', { n: res.cascade_deleted }))
+    } else {
+      toast.success(t('common.deleted'))
+    }
+    await load() // znovu načti seznam (smazání mohlo cascade odstranit i jiný řádek)
+  } catch (e: any) {
+    toast.error(e?.response?.data?.error?.message || t('invoice.delete_failed'))
+  }
+}
 
 const router = useRouter()
 const route = useRoute()
@@ -482,6 +517,7 @@ const monthOptions = computed(() => (tm('common.months_short') as unknown as str
                 <th class="text-center px-4 py-2 font-medium">Splatnost</th>
                 <th class="text-right px-4 py-2 font-medium">{{ t('invoice.amount_to_pay') }}</th>
                 <th class="text-center px-4 py-2 font-medium">Stav</th>
+                <th class="px-2 py-2 w-10"></th>
               </tr>
             </thead>
             <tbody class="divide-y divide-neutral-100">
@@ -528,6 +564,13 @@ const monthOptions = computed(() => (tm('common.months_short') as unknown as str
                     :title="t('invoice.sent_at', { date: formatDate(inv.sent_at) })">✉</span>
                   <span v-if="inv.reminder_count > 0" class="ml-1 text-xs px-1 py-0.5 rounded bg-warning-50 text-warning-600 font-semibold"
                     :title="t('invoice.reminder_at', { count: inv.reminder_count, date: formatDate(inv.last_reminder_at) })">⚠ {{ inv.reminder_count }}</span>
+                </td>
+                <td class="px-2 py-2.5 text-center" @click.stop>
+                  <button v-if="canDeleteInvoice(inv)" @click="deleteInvoiceRow(inv)"
+                    :title="inv.status === 'draft' ? t('common.delete') : t('invoice.delete_force_title')"
+                    class="cursor-pointer p-1.5 rounded text-neutral-400 hover:text-danger-500 hover:bg-danger-50">
+                    <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0 1 16.138 21H7.862a2 2 0 0 1-1.995-1.858L5 7m5 4v6m4-6v6M1 7h22M9 7V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v3"/></svg>
+                  </button>
                 </td>
               </tr>
             </tbody>
@@ -587,6 +630,11 @@ const monthOptions = computed(() => (tm('common.months_short') as unknown as str
                     <span class="text-xs px-2 py-0.5 rounded" :class="statusBadgeClass(inv.status)">
                       {{ statusLabel(inv.status) }}
                     </span>
+                    <button v-if="canDeleteInvoice(inv)" @click.stop="deleteInvoiceRow(inv)"
+                      :title="inv.status === 'draft' ? t('common.delete') : t('invoice.delete_force_title')"
+                      class="cursor-pointer p-1 rounded text-neutral-400 hover:text-danger-500 hover:bg-danger-50">
+                      <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0 1 16.138 21H7.862a2 2 0 0 1-1.995-1.858L5 7m5 4v6m4-6v6M1 7h22M9 7V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v3"/></svg>
+                    </button>
                   </div>
                 </div>
               </div>
